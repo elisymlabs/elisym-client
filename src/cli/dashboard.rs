@@ -1,42 +1,929 @@
-use std::time::Instant;
+use std::io;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-/// Tracks runtime state for the TUI dashboard (stub — not yet wired up).
-#[allow(dead_code)]
-pub struct DashboardState {
-    pub agent_name: String,
-    pub started_at: Instant,
-    pub jobs_received: u64,
-    pub jobs_completed: u64,
-    pub jobs_in_flight: u64,
-    pub total_earned: u64,
-    pub wallet_address: String,
-    pub sol_balance: u64,
-    pub token: String,
-    pub network: String,
-    pub last_event: Option<String>,
+use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use std::collections::HashSet;
+use nostr_sdk::{Filter, Kind, RelayPoolNotification, ToBech32};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::Terminal;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::pubkey::Pubkey;
+use tokio::sync::mpsc;
+use tracing::info;
+
+use super::error::Result;
+
+// ── Types ────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct AgentEntry {
+    name: String,
+    pubkey: String,
+    capabilities: Vec<String>,
+    description: String,
+    price: u64,
+    token: String,
+    chain: String,
+    network: String,
+    solana_address: Option<String>,
+    sol_balance: Option<u64>,
+    total_earned: u64,
+    payment_address: Option<String>,
+    metadata: Option<serde_json::Value>,
+    supported_kinds: Vec<u16>,
 }
 
-#[allow(dead_code)]
+enum DashboardEvent {
+    Tick,
+    Key(KeyEvent),
+    AgentDiscovered(Box<AgentEntry>),
+    JobResultSeen { provider_npub: String, amount: u64 },
+    BalanceUpdates(Vec<(String, u64)>),
+    #[allow(dead_code)]
+    Error(String),
+}
+
+// ── State ────────────────────────────────────────────────────────────
+
+struct DashboardState {
+    chain: String,
+    network: String,
+    started_at: Instant,
+
+    // data
+    discovered_agents: Vec<AgentEntry>,
+
+    // navigation
+    cursor: usize,
+    detail_open: bool,
+    detail_scroll: usize,
+
+    quit: bool,
+}
+
 impl DashboardState {
-    pub fn new(agent_name: String) -> Self {
+    fn new(chain: String, network: String) -> Self {
         Self {
-            agent_name,
+            chain,
+            network,
             started_at: Instant::now(),
-            jobs_received: 0,
-            jobs_completed: 0,
-            jobs_in_flight: 0,
-            total_earned: 0,
-            wallet_address: String::new(),
-            sol_balance: 0,
-            token: "sol".to_string(),
-            network: "devnet".to_string(),
-            last_event: None,
+            discovered_agents: Vec::new(),
+            cursor: 0,
+            detail_open: false,
+            detail_scroll: 0,
+            quit: false,
         }
     }
 
-    pub fn uptime_secs(&self) -> u64 {
-        self.started_at.elapsed().as_secs()
+    fn uptime_str(&self) -> String {
+        let secs = self.started_at.elapsed().as_secs();
+        let m = secs / 60;
+        let s = secs % 60;
+        if m >= 60 {
+            format!("{}h{:02}m{:02}s", m / 60, m % 60, s)
+        } else {
+            format!("{}m{:02}s", m, s)
+        }
+    }
+
+    fn total_earned(&self) -> u64 {
+        self.discovered_agents.iter().map(|a| a.total_earned).sum()
+    }
+
+    fn handle_event(&mut self, ev: DashboardEvent) {
+        match ev {
+            DashboardEvent::Tick => {}
+            DashboardEvent::Key(key) => self.handle_key(key),
+            DashboardEvent::AgentDiscovered(boxed) => {
+                let entry = *boxed;
+                if let Some(existing) = self
+                    .discovered_agents
+                    .iter_mut()
+                    .find(|a| a.pubkey == entry.pubkey)
+                {
+                    existing.price = entry.price;
+                    existing.capabilities = entry.capabilities.clone();
+                    existing.solana_address = entry.solana_address.clone();
+                    existing.description = entry.description.clone();
+                    existing.metadata = entry.metadata.clone();
+                    existing.payment_address = entry.payment_address.clone();
+                } else {
+                    self.discovered_agents.push(entry);
+                }
+            }
+            DashboardEvent::JobResultSeen { provider_npub, amount } => {
+                if let Some(agent) = self
+                    .discovered_agents
+                    .iter_mut()
+                    .find(|a| a.pubkey == provider_npub)
+                {
+                    agent.total_earned += amount;
+                }
+                // Sort: highest earned first
+                self.discovered_agents.sort_by(|a, b| b.total_earned.cmp(&a.total_earned));
+            }
+            DashboardEvent::BalanceUpdates(updates) => {
+                for (addr, balance) in updates {
+                    if let Some(agent) = self
+                        .discovered_agents
+                        .iter_mut()
+                        .find(|a| a.solana_address.as_deref() == Some(&addr))
+                    {
+                        agent.sol_balance = Some(balance);
+                    }
+                }
+            }
+            DashboardEvent::Error(_) => {}
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        use crossterm::event::KeyModifiers;
+
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+
+        // Quit: q or Ctrl+C — from any screen
+        if key.code == KeyCode::Char('q')
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.quit = true;
+            return;
+        }
+
+        if self.detail_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Backspace => {
+                    self.detail_open = false;
+                    self.detail_scroll = 0;
+                }
+                KeyCode::Up => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                self.cursor = self.cursor.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if !self.discovered_agents.is_empty() {
+                    self.cursor = (self.cursor + 1).min(self.discovered_agents.len() - 1);
+                }
+            }
+            KeyCode::Enter => {
+                if !self.discovered_agents.is_empty() {
+                    self.detail_open = true;
+                    self.detail_scroll = 0;
+                }
+            }
+            _ => {}
+        }
     }
 }
 
-// TODO: Full ratatui event loop
+// ── Rendering ────────────────────────────────────────────────────────
+
+fn render(frame: &mut ratatui::Frame, state: &DashboardState) {
+    let area = frame.area();
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Min(3),   // content
+        Constraint::Length(1), // footer
+    ])
+    .split(area);
+
+    render_header(frame, chunks[0], state);
+
+    if state.detail_open {
+        render_detail(frame, chunks[1], state);
+    } else {
+        render_agents_list(frame, chunks[1], state);
+    }
+
+    render_footer(frame, chunks[2], state);
+}
+
+/// Cycle through a set of colors based on elapsed time.
+fn cycle_color(elapsed_ms: u128, period_ms: u128) -> Color {
+    let palette = [
+        Color::Cyan,
+        Color::Blue,
+        Color::Magenta,
+        Color::LightMagenta,
+        Color::Cyan,
+    ];
+    let phase = (elapsed_ms % (period_ms * palette.len() as u128)) / period_ms;
+    palette[phase as usize % palette.len()]
+}
+
+fn render_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
+    let elapsed = state.started_at.elapsed().as_millis();
+
+    // Braille spinner
+    let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let spin_idx = (elapsed / 80) as usize % spinner.len();
+
+    // LIVE indicator — gray while syncing, red once agents discovered
+    let is_live = !state.discovered_agents.is_empty();
+    let live_dot = "●";
+    let live_color = if is_live { Color::Red } else { Color::DarkGray };
+
+    // Earned amount pulse — green/yellow when > 0
+    let total_earned = state.total_earned();
+    let earned_color = if total_earned > 0 {
+        if (elapsed / 800).is_multiple_of(2) {
+            Color::Green
+        } else {
+            Color::Yellow
+        }
+    } else {
+        Color::DarkGray
+    };
+
+    let line = Line::from(vec![
+        Span::styled(
+            " ELISYM PROTOCOL DASHBOARD ",
+            Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
+        ),
+        Span::styled(" ", Style::default()),
+        Span::styled(live_dot, Style::default().fg(live_color)),
+        Span::styled(" LIVE  ", Style::default().fg(live_color).bold()),
+        Span::styled(&state.chain, Style::default().fg(Color::Magenta).bold()),
+        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled(&state.network, Style::default().fg(Color::Yellow).bold()),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("{} agents", state.discovered_agents.len()),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("Total earned: {:.4} SOL", total_earned as f64 / 1e9),
+            Style::default().fg(earned_color).bold(),
+        ),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("{} {}", spinner[spin_idx], state.uptime_str()),
+            Style::default().fg(Color::Green),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_agents_list(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
+    let elapsed = state.started_at.elapsed().as_millis();
+    let border_color = cycle_color(elapsed, 2000);
+
+    if state.discovered_agents.is_empty() {
+        // Animated scanning text
+        let dots_count = ((elapsed / 400) % 4) as usize;
+        let dots: String = ".".repeat(dots_count);
+        let scan_frames = ["◜", "◠", "◝", "◞", "◡", "◟"];
+        let scan_idx = (elapsed / 150) as usize % scan_frames.len();
+        let msg = Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {} ", scan_frames[scan_idx]),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled("Scanning network for agents", Style::default().fg(Color::White)),
+            Span::styled(dots, Style::default().fg(Color::Cyan)),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Agents ")
+                .border_style(Style::default().fg(border_color)),
+        );
+        frame.render_widget(msg, area);
+        return;
+    }
+
+    let header = Row::new(vec![
+        "Name",
+        "Pubkey",
+        "Capabilities",
+        "Price",
+        "Earned",
+    ])
+    .style(Style::default().bold().fg(Color::Cyan))
+    .bottom_margin(1);
+
+    let content_height = area.height.saturating_sub(4) as usize;
+    let agent_count = state.discovered_agents.len();
+
+    let viewport_start = if state.cursor >= content_height {
+        state.cursor - content_height + 1
+    } else {
+        0
+    };
+
+    let rows: Vec<Row> = state
+        .discovered_agents
+        .iter()
+        .enumerate()
+        .skip(viewport_start)
+        .take(content_height)
+        .map(|(i, a)| {
+            let price_str = if a.token == "usdc" {
+                format!("{:.6} USDC", a.price as f64 / 1e6)
+            } else {
+                format!("{:.4} SOL", a.price as f64 / 1e9)
+            };
+            let earned_str = if a.total_earned > 0 {
+                format!("{:.4}", a.total_earned as f64 / 1e9)
+            } else {
+                "—".to_string()
+            };
+            let caps = truncate(&a.capabilities.join(", "), 28);
+
+            let style = if i == state.cursor {
+                Style::default()
+                    .bg(Color::Rgb(30, 60, 80))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                // Subtle alternating row colors
+                let bg = if i % 2 == 0 {
+                    Color::Reset
+                } else {
+                    Color::Rgb(20, 20, 30)
+                };
+                Style::default().bg(bg).fg(Color::White)
+            };
+
+            // Earned column with color based on amount
+            let earned_cell = if a.total_earned > 0 {
+                Cell::from(earned_str).style(Style::default().fg(Color::Green))
+            } else {
+                Cell::from(earned_str).style(Style::default().fg(Color::DarkGray))
+            };
+
+            Row::new(vec![
+                Cell::from(truncate(&a.name, 20)),
+                Cell::from(truncate(&a.pubkey, 16)).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(caps),
+                Cell::from(price_str),
+                earned_cell,
+            ])
+            .style(style)
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(22),
+        Constraint::Length(18),
+        Constraint::Length(30),
+        Constraint::Length(16),
+        Constraint::Length(12),
+    ];
+
+    let title = format!(" Agents ({}) ", agent_count);
+
+    let table = Table::new(rows, widths).header(header).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(title, Style::default().fg(Color::Cyan).bold()))
+            .border_style(Style::default().fg(border_color)),
+    );
+
+    frame.render_widget(table, area);
+}
+
+fn render_detail(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
+    let agent = match state.discovered_agents.get(state.cursor) {
+        Some(a) => a,
+        None => return,
+    };
+
+    let mut lines: Vec<Line> = vec![
+        // Name
+        Line::from(vec![
+            Span::styled("  Name          ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&agent.name, Style::default().fg(Color::Cyan).bold()),
+        ]),
+        Line::raw(""),
+        // Description
+        Line::from(vec![
+            Span::styled("  Description   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&agent.description, Style::default().fg(Color::White)),
+        ]),
+        Line::raw(""),
+        // Pubkey (full)
+        Line::from(vec![
+            Span::styled("  Pubkey        ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&agent.pubkey, Style::default().fg(Color::White)),
+        ]),
+        Line::raw(""),
+        // Capabilities header
+        Line::from(Span::styled(
+            "  Capabilities",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    if agent.capabilities.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    (none)",
+            Style::default().fg(Color::DarkGray).italic(),
+        )));
+    } else {
+        for cap in &agent.capabilities {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled("• ", Style::default().fg(Color::Cyan)),
+                Span::styled(cap.as_str(), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+    lines.push(Line::raw(""));
+
+    // Price
+    let price_str = if agent.token == "usdc" {
+        format!("{:.6} USDC", agent.price as f64 / 1e6)
+    } else {
+        format!("{:.4} SOL", agent.price as f64 / 1e9)
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  Price         ", Style::default().fg(Color::DarkGray)),
+        Span::styled(price_str, Style::default().fg(Color::Green)),
+    ]));
+    lines.push(Line::raw(""));
+
+    // Chain / Network
+    lines.push(Line::from(vec![
+        Span::styled("  Chain         ", Style::default().fg(Color::DarkGray)),
+        Span::styled(&agent.chain, Style::default().fg(Color::Magenta)),
+        Span::styled(" / ", Style::default().fg(Color::DarkGray)),
+        Span::styled(&agent.network, Style::default().fg(Color::Yellow)),
+    ]));
+    lines.push(Line::raw(""));
+
+    // Payment address
+    if let Some(ref addr) = agent.payment_address {
+        lines.push(Line::from(vec![
+            Span::styled("  Pay Address   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(addr.as_str(), Style::default().fg(Color::White)),
+        ]));
+        lines.push(Line::raw(""));
+    }
+
+    // SOL Balance
+    if let Some(balance) = agent.sol_balance {
+        lines.push(Line::from(vec![
+            Span::styled("  SOL Balance   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:.9} SOL", balance as f64 / 1e9),
+                Style::default().fg(Color::Green),
+            ),
+        ]));
+        lines.push(Line::raw(""));
+    }
+
+    // Total Earned
+    if agent.total_earned > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("  Total Earned  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:.9} SOL", agent.total_earned as f64 / 1e9),
+                Style::default().fg(Color::Yellow).bold(),
+            ),
+        ]));
+        lines.push(Line::raw(""));
+    }
+
+    // Supported job kinds
+    if !agent.supported_kinds.is_empty() {
+        let kinds_str: Vec<String> = agent.supported_kinds.iter().map(|k| k.to_string()).collect();
+        lines.push(Line::from(vec![
+            Span::styled("  Job Kinds     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(kinds_str.join(", "), Style::default().fg(Color::White)),
+        ]));
+        lines.push(Line::raw(""));
+    }
+
+    // Metadata (raw JSON, if present)
+    if let Some(ref meta) = agent.metadata {
+        lines.push(Line::from(Span::styled(
+            "  Metadata",
+            Style::default().fg(Color::DarkGray),
+        )));
+        if let Ok(pretty) = serde_json::to_string_pretty(meta) {
+            for json_line in pretty.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", json_line),
+                    Style::default().fg(Color::White),
+                )));
+            }
+        }
+        lines.push(Line::raw(""));
+    }
+
+    // Apply scroll
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible_height);
+    let scroll = state.detail_scroll.min(max_scroll);
+
+    let elapsed = state.started_at.elapsed().as_millis();
+    let border_color = cycle_color(elapsed, 2000);
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    format!(" {} ", agent.name),
+                    Style::default().fg(Color::Cyan).bold(),
+                ))
+                .border_style(Style::default().fg(border_color)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((scroll as u16, 0));
+
+    frame.render_widget(paragraph, area);
+}
+
+fn render_footer(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
+    let controls = if state.detail_open {
+        vec![
+            Span::styled(" esc", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(":back  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("↑↓", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(":scroll  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("q/ctrl+c", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(":quit", Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        vec![
+            Span::styled(" ↑↓", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(":navigate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("enter", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(":details  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("q/ctrl+c", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(":quit", Style::default().fg(Color::DarkGray)),
+        ]
+    };
+
+    let mut spans = controls;
+    spans.push(Span::styled("  | ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        "Elisym protocol - Decentralized AI agent economy",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+// ── Terminal guard ───────────────────────────────────────────────────
+
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn init() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+        Ok(terminal)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
+
+// ── Event collectors ─────────────────────────────────────────────────
+
+fn spawn_tick(tx: mpsc::Sender<DashboardEvent>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            interval.tick().await;
+            if tx.send(DashboardEvent::Tick).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn spawn_input(tx: mpsc::Sender<DashboardEvent>) {
+    tokio::task::spawn_blocking(move || loop {
+        if event::poll(Duration::from_millis(100)).unwrap_or(false) {
+            if let Ok(CEvent::Key(key)) = event::read() {
+                if tx.blocking_send(DashboardEvent::Key(key)).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_discovery(
+    agent: Arc<elisym_core::AgentNode>,
+    chain: String,
+    network: String,
+    tx: mpsc::Sender<DashboardEvent>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let filter = elisym_core::AgentFilter::default();
+            match agent.discovery.search_agents(&filter).await {
+                Ok(agents) => {
+                    for a in agents {
+                        // Filter by chain + network
+                        let agent_chain = extract_chain(&a);
+                        let agent_network = extract_network(&a);
+                        if !agent_chain.eq_ignore_ascii_case(&chain)
+                            || !agent_network.eq_ignore_ascii_case(&network)
+                        {
+                            continue;
+                        }
+
+                        // Skip agents without capabilities (e.g. observer nodes)
+                        if a.card.capabilities.is_empty() {
+                            continue;
+                        }
+
+                        let (price, token) = extract_price(&a);
+                        let npub_str = a.pubkey.to_bech32().unwrap_or_default();
+                        let entry = AgentEntry {
+                            name: a.card.name.clone(),
+                            pubkey: npub_str,
+                            capabilities: a.card.capabilities.clone(),
+                            description: a.card.description.clone(),
+                            price,
+                            token,
+                            chain: agent_chain,
+                            network: agent_network,
+                            solana_address: a.card.payment_address.clone(),
+                            sol_balance: None,
+                            total_earned: 0,
+                            payment_address: a.card.payment_address.clone(),
+                            metadata: a.card.metadata.clone(),
+                            supported_kinds: a.supported_kinds.clone(),
+                        };
+                        if tx.send(DashboardEvent::AgentDiscovered(Box::new(entry))).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(DashboardEvent::Error(format!("discovery: {}", e)))
+                        .await;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_balance_poller(
+    rpc: Arc<RpcClient>,
+    agent: Arc<elisym_core::AgentNode>,
+    tx: mpsc::Sender<DashboardEvent>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+
+            let filter = elisym_core::AgentFilter::default();
+            let addresses: Vec<String> = match agent.discovery.search_agents(&filter).await {
+                Ok(agents) => agents
+                    .iter()
+                    .filter_map(|a| a.card.payment_address.clone())
+                    .collect(),
+                Err(_) => continue,
+            };
+
+            if addresses.is_empty() {
+                continue;
+            }
+
+            let rpc = Arc::clone(&rpc);
+            let result = tokio::task::spawn_blocking(move || {
+                let mut updates = Vec::new();
+                for addr_str in &addresses {
+                    if let Ok(pubkey) = addr_str.parse::<Pubkey>() {
+                        if let Ok(balance) = rpc.get_balance(&pubkey) {
+                            updates.push((addr_str.clone(), balance));
+                        }
+                    }
+                }
+                updates
+            })
+            .await;
+
+            if let Ok(updates) = result {
+                if !updates.is_empty()
+                    && tx.send(DashboardEvent::BalanceUpdates(updates)).await.is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_job_results(
+    agent: Arc<elisym_core::AgentNode>,
+    tx: mpsc::Sender<DashboardEvent>,
+) {
+    tokio::spawn(async move {
+        // Subscribe to all kind 6100 events (job results for offset 100) — no #p filter
+        // No `since` filter — fetch historical results too
+        let result_kind = Kind::from(elisym_core::KIND_JOB_RESULT_BASE + 100);
+        let filter = Filter::new()
+            .kind(result_kind);
+
+        if agent.client.subscribe(vec![filter], None).await.is_err() {
+            return;
+        }
+
+        let mut notifications = agent.client.notifications();
+        let mut seen = HashSet::new();
+        while let Ok(notification) = notifications.recv().await {
+            if let RelayPoolNotification::Event { event, .. } = notification {
+                // Deduplicate across relays
+                if !seen.insert(event.id) {
+                    continue;
+                }
+
+                let kind_num = event.kind.as_u16();
+                if !(elisym_core::KIND_JOB_RESULT_BASE..elisym_core::KIND_JOB_FEEDBACK)
+                    .contains(&kind_num)
+                {
+                    continue;
+                }
+
+                // Extract amount from "amount" tag
+                let amount = event.tags.iter().find_map(|tag| {
+                    let s = tag.as_slice();
+                    if s.first().map(|v| v.as_str()) == Some("amount") {
+                        s.get(1).and_then(|v| v.parse::<u64>().ok())
+                    } else {
+                        None
+                    }
+                });
+
+                let amount = match amount {
+                    Some(a) => a,
+                    None => continue, // skip results without amount
+                };
+
+                let provider_npub = event.pubkey.to_bech32().unwrap_or_default();
+
+                if tx
+                    .send(DashboardEvent::JobResultSeen {
+                        provider_npub,
+                        amount,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+// ── Entry point ──────────────────────────────────────────────────────
+
+fn resolve_rpc_url(network: &str, rpc_url: Option<&str>) -> String {
+    if let Some(url) = rpc_url {
+        return url.to_string();
+    }
+    match network {
+        "mainnet" => elisym_core::SolanaNetwork::Mainnet.rpc_url(),
+        "testnet" => elisym_core::SolanaNetwork::Testnet.rpc_url(),
+        _ => elisym_core::SolanaNetwork::Devnet.rpc_url(),
+    }
+}
+
+pub async fn run_dashboard(chain: String, network: String, rpc_url: Option<String>) -> Result<()> {
+    info!(chain = %chain, network = %network, "launching protocol dashboard (observer mode)");
+
+    // Build ephemeral observer node — no identity, no wallet, no capabilities
+    let agent = elisym_core::AgentNodeBuilder::new("elisym-observer", "Protocol dashboard observer")
+        .capabilities(vec![])
+        .build()
+        .await?;
+    let agent = Arc::new(agent);
+
+    // Build Solana RPC client for balance queries
+    let resolved_rpc = resolve_rpc_url(&network, rpc_url.as_deref());
+    let rpc = Arc::new(RpcClient::new_with_commitment(
+        resolved_rpc,
+        CommitmentConfig::confirmed(),
+    ));
+
+    // Init state
+    let mut state = DashboardState::new(chain.clone(), network.clone());
+
+    // Channel
+    let (tx, mut rx) = mpsc::channel::<DashboardEvent>(256);
+
+    // Spawn collectors
+    spawn_tick(tx.clone());
+    spawn_input(tx.clone());
+    spawn_discovery(Arc::clone(&agent), chain, network, tx.clone());
+    spawn_balance_poller(Arc::clone(&rpc), Arc::clone(&agent), tx.clone());
+    spawn_job_results(Arc::clone(&agent), tx.clone());
+    drop(tx);
+
+    // Terminal
+    let _guard = TerminalGuard;
+    let mut terminal = TerminalGuard::init()?;
+
+    // Render loop
+    loop {
+        terminal.draw(|frame| render(frame, &state))?;
+
+        if let Some(ev) = rx.recv().await {
+            state.handle_event(ev);
+        } else {
+            break;
+        }
+
+        while let Ok(ev) = rx.try_recv() {
+            state.handle_event(ev);
+        }
+
+        if state.quit {
+            break;
+        }
+    }
+
+    // Cleanup: restore terminal, then exit immediately
+    drop(terminal);
+    drop(_guard);
+
+    info!("dashboard closed");
+
+    // Force exit — background tasks (discovery, balance poller) would hang otherwise
+    std::process::exit(0);
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..s.floor_char_boundary(max.saturating_sub(1))])
+    }
+}
+
+fn extract_chain(agent: &elisym_core::DiscoveredAgent) -> String {
+    agent
+        .card
+        .metadata
+        .as_ref()
+        .and_then(|m| m["chain"].as_str())
+        .unwrap_or("solana")
+        .to_string()
+}
+
+fn extract_network(agent: &elisym_core::DiscoveredAgent) -> String {
+    agent
+        .card
+        .metadata
+        .as_ref()
+        .and_then(|m| m["network"].as_str())
+        .unwrap_or("devnet")
+        .to_string()
+}
+
+fn extract_price(agent: &elisym_core::DiscoveredAgent) -> (u64, String) {
+    if let Some(ref meta) = agent.card.metadata {
+        let price = meta["job_price"].as_u64().unwrap_or(0);
+        let token = meta["token"].as_str().unwrap_or("sol").to_string();
+        (price, token)
+    } else {
+        (0, "sol".to_string())
+    }
+}

@@ -136,6 +136,7 @@ pub async fn run() -> Result<()> {
         Some(Commands::Wallet { name }) => cmd_wallet(&name)?,
         Some(Commands::Airdrop { name, amount }) => cmd_airdrop(&name, amount)?,
         Some(Commands::Send { name, address, amount }) => cmd_send(&name, &address, amount)?,
+        Some(Commands::Dashboard { chain, network, rpc_url }) => cmd_dashboard(&chain, &network, rpc_url).await?,
         None => {
             // No subcommand — show banner and help
             print!("{}", banner::BANNER);
@@ -711,7 +712,31 @@ async fn prompt_capabilities_llm(config: &AgentConfig) -> Result<Vec<(String, St
           - \"prompt\": a detailed system prompt (2-4 sentences) that instructs an AI to excel at this capability\n\
         Return 3-8 capabilities. Return ONLY the JSON, no other text.";
 
-    let response = llm.complete(system, &description).await?;
+    let max_retries = 3;
+    let mut response = String::new();
+    for attempt in 0..max_retries {
+        match llm.complete(system, &description).await {
+            Ok(r) => {
+                response = r;
+                break;
+            }
+            Err(e) => {
+                if attempt + 1 < max_retries {
+                    println!(
+                        "  {} {}\n  {} Retrying in 10 seconds... (attempt {}/{})",
+                        style("!").yellow(),
+                        e,
+                        style("~").dim(),
+                        attempt + 2,
+                        max_retries,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
 
     // Parse JSON from LLM response (handle possible markdown fencing)
     let json_str = response
@@ -1150,6 +1175,12 @@ fn display_wallet_status(solana: &elisym_core::SolanaPaymentProvider, cfg: &Agen
     }
 
     Ok(())
+}
+
+// ── dashboard ─────────────────────────────────────────────────────
+
+async fn cmd_dashboard(chain: &str, network: &str, rpc_url: Option<String>) -> Result<()> {
+    dashboard::run_dashboard(chain.to_string(), network.to_string(), rpc_url).await
 }
 
 fn format_sol(lamports: u64) -> String {

@@ -66,4 +66,17 @@ pub enum Commands {
         /// Amount to send (in SOL or USDC depending on agent config)
         amount: f64,
     },
+
+    /// Launch live protocol dashboard (global observer mode)
+    Dashboard {
+        /// Payment chain to observe (solana, lightning)
+        #[arg(long, default_value = "solana")]
+        chain: String,
+        /// Network for on-chain data (devnet, testnet, mainnet)
+        #[arg(long, default_value = "devnet")]
+        network: String,
+        /// Custom Solana RPC URL (overrides --network default)
+        #[arg(long)]
+        rpc_url: Option<String>,
+    },
 }

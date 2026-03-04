@@ -179,7 +179,7 @@ pub async fn run_customer_repl(mut agent: AgentNode, config: &AgentConfig) -> Re
         }
 
         // Run all steps in a cancellable block — Ctrl+C at any point breaks out
-        let step_result = handle_request(&agent, &llm, &input, &mut feedback_rx).await;
+        let step_result = handle_request(&agent, &llm, &input, &mut feedback_rx, &config.payment.chain, &config.payment.network).await;
 
         match step_result {
             RequestOutcome::Done | RequestOutcome::Continue => {}
@@ -212,11 +212,13 @@ async fn handle_request(
     llm: &LlmClient,
     input: &str,
     feedback_rx: &mut mpsc::Receiver<JobFeedback>,
+    chain: &str,
+    network: &str,
 ) -> RequestOutcome {
     tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => RequestOutcome::Interrupted,
-        outcome = handle_request_inner(agent, llm, input, feedback_rx) => outcome,
+        outcome = handle_request_inner(agent, llm, input, feedback_rx, chain, network) => outcome,
     }
 }
 
@@ -226,6 +228,8 @@ async fn handle_request_inner(
     llm: &LlmClient,
     input: &str,
     feedback_rx: &mut mpsc::Receiver<JobFeedback>,
+    chain: &str,
+    network: &str,
 ) -> RequestOutcome {
     // ── Step 1: Intent extraction ────────────────────────────────
     println!(
@@ -262,12 +266,25 @@ async fn handle_request_inner(
         Err(e) => return RequestOutcome::Err(e.into()),
     };
 
+    // Filter by chain + network: only show providers on the same payment chain and network
+    let filter_chain_network = |p: &DiscoveredAgent| -> bool {
+        let meta = match p.card.metadata.as_ref() {
+            Some(m) => m,
+            None => return false,
+        };
+        let agent_chain = meta["chain"].as_str().unwrap_or("solana");
+        let agent_network = meta["network"].as_str().unwrap_or("devnet");
+        agent_chain.eq_ignore_ascii_case(chain) && agent_network.eq_ignore_ascii_case(network)
+    };
+    providers.retain(filter_chain_network);
+
     if providers.is_empty() && !keywords.is_empty() {
-        info!("filtered search returned 0 — falling back to unfiltered");
+        info!("filtered search returned 0 — falling back to unfiltered (same chain/network)");
         providers = match agent.discovery.search_agents(&AgentFilter::default()).await {
             Ok(p) => p,
             Err(e) => return RequestOutcome::Err(e.into()),
         };
+        providers.retain(filter_chain_network);
     }
 
     if providers.is_empty() {

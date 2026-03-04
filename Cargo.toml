@@ -22,6 +22,7 @@ toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 solana-sdk = "2.2"
+solana-client = "2.2"
 bs58 = "0.5"
 nostr-sdk = "0.37"
 thiserror = "2"

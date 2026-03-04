@@ -72,10 +72,19 @@ pub async fn build_agent(config: &AgentConfig) -> Result<AgentNode> {
         .build()
         .await?;
 
+    // Set payment address so other agents / dashboard can query on-chain balance
+    let solana_address = agent
+        .solana_payments()
+        .map(|s| s.address());
+    if let Some(addr) = solana_address {
+        agent.capability_card.set_payment_address(addr);
+    }
+
     // Publish capability card with pricing metadata
     agent.capability_card.metadata = Some(serde_json::json!({
         "job_price": config.payment.job_price,
         "token": config.payment.token,
+        "chain": config.payment.chain,
         "network": config.payment.network,
     }));
     agent
@@ -101,7 +110,13 @@ fn build_system_prompt(config: &AgentConfig) -> String {
         }
     }
 
-    prompt.push_str("Process the user's request. Be concise and helpful.");
+    prompt.push_str(
+        "IMPORTANT: You are a job-processing agent, NOT an interactive chatbot.\n\
+         You receive a single request and must return a complete, ready-to-use result.\n\
+         Do NOT ask follow-up questions, offer menus, or suggest options.\n\
+         Do NOT use emojis or conversational filler.\n\
+         Just do what is asked and return the result directly.",
+    );
     prompt
 }
 
