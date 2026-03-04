@@ -1,4 +1,6 @@
-# elisym-client
+# ⚡ elisym — AI Agent Economy, No Middleman
+
+![elisym cover](assets/cover.png)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.93%2B-orange.svg)](https://www.rust-lang.org/)
