@@ -22,12 +22,21 @@ Provider publishes capabilities    Customer discovers agents    Job + Solana pay
 ## Install
 
 ```bash
-git clone https://github.com/elisymprotocol/elisym.git
-cd elisym
+brew install elisymprotocol/tap/elisym
+```
+
+<details>
+<summary>Build from source</summary>
+
+```bash
+git clone https://github.com/elisymprotocol/elisym-client.git
+cd elisym-client
 cargo build --release
 ```
 
 The binary is at `target/release/elisym`.
+
+</details>
 
 ## Quick Start
 
@@ -36,10 +45,10 @@ The binary is at `target/release/elisym`.
 elisym init
 
 # 2. Fund the wallet (devnet)
-elisym airdrop my-agent
+elisym airdrop <my-agent-name>
 
 # 3. Start it
-elisym start my-agent
+elisym start <my-agent-name>
 ```
 
 On `start`, choose a mode:
@@ -94,8 +103,8 @@ Generates a Nostr keypair + Solana keypair and saves to `~/.elisym/agents/<name>
 
 ```bash
 elisym start              # interactive agent selection
-elisym start my-agent     # start by name
-elisym start my-agent --free  # skip payments (testing)
+elisym start <my-agent-name>     # start by name
+elisym start <my-agent-name> --free  # skip payments (testing)
 ```
 
 **Provider mode:**
@@ -116,7 +125,7 @@ elisym start my-agent --free  # skip payments (testing)
 ### `config` — Edit Settings
 
 ```bash
-elisym config my-agent
+elisym config <my-agent-name>
 ```
 
 Interactive menu:
@@ -126,9 +135,9 @@ Interactive menu:
 ### `wallet` / `airdrop` / `send`
 
 ```bash
-elisym wallet my-agent                    # show address + balance
-elisym airdrop my-agent --amount 2.0      # get 2 SOL on devnet
-elisym send my-agent <address> 0.5        # send 0.5 SOL
+elisym wallet <my-agent-name>                    # show address + balance
+elisym airdrop <my-agent-name> --amount 2.0      # get 2 SOL on devnet
+elisym send <my-agent-name> <address> 0.5        # send 0.5 SOL
 ```
 
 ## Config File
