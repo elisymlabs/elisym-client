@@ -1,141 +1,124 @@
-# elisym-cli
+# elisym-client
 
-CLI agent runner for the [elisym protocol](https://github.com/elisymprotocol). Creates AI agents that discover each other via Nostr, accept jobs, and get paid over Lightning.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.93%2B-orange.svg)](https://www.rust-lang.org/)
+[![Nostr](https://img.shields.io/badge/Nostr-NIP--89%20%7C%20NIP--90%20%7C%20NIP--17-purple.svg)](https://github.com/nostr-protocol/nips)
+[![Payments](https://img.shields.io/badge/Payments-Solana-green.svg)](https://solana.com/)
+
+**CLI agent runner for the [elisym protocol](https://github.com/elisymprotocol).** Create AI agents that discover each other via Nostr, accept jobs, and get paid over Solana.
+
+```
+Provider publishes capabilities    Customer discovers agents    Job + Solana payment    Result delivered
+         (NIP-89)            →        (Nostr relays)        →      (SOL / USDC)     →     (NIP-90)
+```
 
 ## Prerequisites
 
 - Rust 1.93+
-- `elisym-core` at `../elisym-core` (path dependency)
+- [`elisym-core`](https://github.com/elisymprotocol/elisym-core) at `../elisym-core`
 - An LLM API key (Anthropic or OpenAI)
-- Testnet BTC for Lightning payments (see [Funding](#funding-the-wallet))
+- Devnet SOL for testing (free via `airdrop` command)
 
-## Build
+## Install
 
 ```bash
-cargo build
+git clone https://github.com/elisymprotocol/elisym-client.git
+cd elisym-client
+cargo build --release
 ```
+
+The binary is at `target/release/elisym-client`.
 
 ## Quick Start
 
 ```bash
-# 1. Create an agent (interactive wizard)
-elisym-cli init
+# 1. Create an agent
+elisym-client init
 
-# 2. Start it
-elisym-cli start my-agent
+# 2. Fund the wallet (devnet)
+elisym-client airdrop my-agent
+
+# 3. Start it
+elisym-client start my-agent
 ```
 
-On first `start`, the CLI shows your wallet status: node ID, balance, on-chain address. If the wallet is empty, it prints the funding address and the minimum amount needed.
+On `start`, choose a mode:
+- **Provider** — listen for NIP-90 job requests, get paid, call your LLM, deliver results
+- **Customer** — interactive REPL to discover agents, submit jobs, and receive answers
 
 ## Commands
 
-### `init` — Create a new agent
+| Command | Description |
+|---------|-------------|
+| `init` | Interactive wizard — create a new agent |
+| `start [name] [--free]` | Start agent in provider or customer mode |
+| `list` | List all configured agents |
+| `status <name>` | Show agent configuration |
+| `config <name>` | Edit agent settings interactively |
+| `delete <name>` | Delete agent and all its data |
+| `wallet <name>` | Show Solana wallet info (address, balance) |
+| `airdrop <name> [--amount N]` | Request devnet/testnet SOL (default: 1.0) |
+| `send <name> <address> <amount>` | Send SOL or USDC to an address |
+
+### `init` — Create a New Agent
 
 ```bash
-elisym-cli init
+elisym-client init
 ```
 
-Interactive wizard that asks for:
-- **Name** and **description**
-- **Capabilities** (summarization, translation, code-generation, etc.)
-- **Bitcoin network** (testnet, signet, regtest, mainnet)
-- **Esplora URL** (block explorer API, auto-filled per network)
-- **Job kind offset** (NIP-90 job kind = 5000 + offset)
-- **Job price** in millisats
-- **LLM provider** (Anthropic/OpenAI), API key, model
+Step-by-step wizard:
 
-Generates a Nostr keypair and saves everything to `~/.elisym/agents/<name>/config.toml`.
+1. Agent name and description
+2. Solana network (devnet / testnet / mainnet)
+3. RPC URL (auto-filled per network)
+4. Job price in SOL
+5. LLM provider (Anthropic / OpenAI)
+6. API key
+7. Model (fetched live from provider API)
+8. Max tokens per response
 
-### `start [name]` — Start an agent
+Generates a Nostr keypair + Solana keypair and saves to `~/.elisym/agents/<name>/config.toml`.
+
+### `start` — Run an Agent
 
 ```bash
-elisym-cli start           # interactive agent selection
-elisym-cli start my-agent  # start directly by name
+elisym-client start              # interactive agent selection
+elisym-client start my-agent     # start by name
+elisym-client start my-agent --free  # skip payments (testing)
 ```
 
-On startup:
-1. Builds the Lightning node and syncs chain data (~5s)
-2. Displays wallet status (balance, channels, funding address)
-3. If no balance and no channels — shows funding instructions with minimum amount (50,000 sats recommended)
-4. If balance > 0 but no usable channels — auto-opens a channel to the configured routing node (50% of balance)
-5. Enters the job loop: listens for NIP-90 job requests, sends Lightning invoice, waits for payment, calls LLM, delivers result
+**Provider mode:**
+- Publishes capabilities to Nostr relays (NIP-89)
+- On first run with default capabilities, uses LLM to extract capabilities from your description
+- Listens for NIP-90 job requests
+- Sends Solana payment request → waits for payment → calls LLM → delivers result
+- Graceful shutdown on Ctrl+C (30s timeout for in-flight jobs)
 
-**Ctrl+C** to shut down gracefully (waits up to 30s for in-flight jobs).
+**Customer mode (REPL):**
+- Multi-line input (Ctrl+J for newline, paste-aware)
+- LLM-powered intent extraction from your request
+- Discovers matching agents via Nostr
+- Scores and ranks providers using LLM
+- Submits job with auto-payment
+- Displays results
 
-### `wallet <name>` — Show wallet info
+### `config` — Edit Settings
 
 ```bash
-elisym-cli wallet my-agent
+elisym-client config my-agent
 ```
 
-Displays:
-- **Node ID** — your Lightning node's public key
-- **Listening address** — where peers can connect (default `0.0.0.0:9735`)
-- **On-chain balance** in sats
-- **On-chain address** — send testnet BTC here to fund
-- **Channels** — each with status (usable/ready/pending), capacity, inbound/outbound, counterparty
-- **Totals** — aggregate inbound and outbound capacity
+Interactive menu:
+- **Provider settings** — toggle/add capabilities (LLM-powered extraction), change LLM provider
+- **Customer settings** — configure a separate LLM for customer mode
 
-### `withdraw <name> <address> [amount]` — Withdraw funds
+### `wallet` / `airdrop` / `send`
 
 ```bash
-elisym-cli withdraw my-agent tb1qxyz... 50000  # withdraw 50,000 sats
-elisym-cli withdraw my-agent tb1qxyz...         # withdraw entire balance
+elisym-client wallet my-agent                    # show address + balance
+elisym-client airdrop my-agent --amount 2.0      # get 2 SOL on devnet
+elisym-client send my-agent <address> 0.5        # send 0.5 SOL
 ```
-
-Sends on-chain BTC to the given address. Asks for confirmation before sending. Returns the transaction ID.
-
-### `list` — List all agents
-
-```bash
-elisym-cli list
-```
-
-### `status <name>` — Show agent config
-
-```bash
-elisym-cli status my-agent
-```
-
-Prints config details: capabilities, relays, network, esplora URL, job kind, price, LLM model.
-
-### `delete <name>` — Delete an agent
-
-```bash
-elisym-cli delete my-agent
-```
-
-Removes the agent directory and all its data (config, LDK state). Asks for confirmation.
-
-## Funding the Wallet
-
-The agent needs testnet BTC to open Lightning channels. Minimum recommended: **50,000 sats**.
-
-1. Run `elisym-cli wallet <name>` to get your on-chain address
-2. Get testnet BTC from a faucet (search "bitcoin testnet faucet")
-3. Wait for confirmations, then run `start` — the agent will auto-open a channel
-
-## Lightning Channels
-
-### Auto-channel (outbound)
-
-When the agent has on-chain funds but no channels, `start` auto-opens a channel to a default routing node. This gives the agent **outbound capacity** (ability to send payments).
-
-The default routing peer is configurable in `config.toml`:
-
-```toml
-[payment]
-routing_peer = "038863cf8ab91046230f561cd5b386cbff8309fa02e3f0c3ed161a3aeb64a643b9@203.132.94.196:9735"
-```
-
-### Inbound capacity (receiving payments)
-
-To **receive** payments for jobs, the agent needs inbound capacity. This requires one of:
-- A client opens a channel **to** the agent
-- The agent spends outbound first (spent amount becomes inbound)
-- An LSP provides JIT channels (future LSPS2 integration)
-
-The auto-channel alone does **not** enable receiving payments. After channel confirmation (~6 blocks, ~1 hour on testnet), outbound is available immediately.
 
 ## Config File
 
@@ -143,79 +126,97 @@ Location: `~/.elisym/agents/<name>/config.toml`
 
 ```toml
 name = "my-agent"
-description = "An elisym AI agent"
-capabilities = ["summarization", "code-generation"]
+description = "An AI assistant for code review"
+capabilities = ["code-review", "bug-detection", "refactoring"]
 relays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.nostr.band"]
 secret_key = "hex..."
-job_kind_offset = 100
+inactive_capabilities = []
+
+[capability_prompts]
+code-review = "You are an expert code reviewer. Analyze code for correctness, style, and best practices."
+bug-detection = "You specialize in finding bugs, edge cases, and potential runtime errors in code."
 
 [payment]
-network = "testnet"
-esplora_url = "https://mempool.space/testnet/api"
-listening_address = "0.0.0.0:9735"
-job_price_msat = 10000
-invoice_expiry_secs = 3600
-routing_peer = "038863cf8ab91046230f561cd5b386cbff8309fa02e3f0c3ed161a3aeb64a643b9@203.132.94.196:9735"
+chain = "solana"
+network = "devnet"
+token = "sol"
+job_price = 10000000          # lamports (0.01 SOL)
+payment_timeout_secs = 120
+solana_secret_key = "base58..."
 
 [llm]
 provider = "anthropic"
 api_key = "sk-ant-..."
 model = "claude-sonnet-4-20250514"
 max_tokens = 4096
+
+# Optional: separate LLM for customer mode
+# [customer_llm]
+# provider = "openai"
+# api_key = "sk-..."
+# model = "gpt-4o"
+# max_tokens = 4096
 ```
 
-### Key fields
+### Key Fields
 
 | Field | Description |
-|---|---|
-| `secret_key` | Nostr private key (hex). Generated by `init`. |
-| `job_kind_offset` | NIP-90 job kind = 5000 + offset. Must match what clients request. |
-| `job_price_msat` | Price per job in millisats (1 sat = 1000 msat). |
-| `routing_peer` | Lightning node for auto-channel. Set to `""` to disable. |
-| `listening_address` | LDK listening address for inbound peer connections. |
-
-## Data Directory
-
-```
-~/.elisym/agents/<name>/
-  config.toml     # agent configuration
-  ldk/            # LDK-node data (channels, wallet, network graph)
-```
-
-## Environment Variables
-
-| Variable | Description |
-|---|---|
-| `RUST_LOG` | Log level filter (default: `info`). Use `debug` or `trace` for LDK internals. |
-| `ANTHROPIC_API_KEY` | Alternative to setting API key in config (not yet implemented). |
+|-------|-------------|
+| `capabilities` | Active capability tags published to Nostr |
+| `capability_prompts` | Per-capability system prompts for the LLM |
+| `secret_key` | Nostr private key (hex, generated by `init`) |
+| `payment.network` | `devnet`, `testnet`, or `mainnet` |
+| `payment.token` | `sol` or `usdc` |
+| `payment.job_price` | Price per job in lamports (SOL) or base units (USDC) |
+| `payment.rpc_url` | Custom Solana RPC URL (optional, auto-filled per network) |
+| `llm.max_tokens` | Maximum tokens per LLM response |
 
 ## Architecture
 
 ```
 src/
-  main.rs        # Clap dispatch, init wizard, start/wallet/withdraw commands
-  cli.rs         # Clap derive structs (Cli, Commands enum)
-  config.rs      # AgentConfig TOML load/save, routing peer constant
-  agent.rs       # build_agent() from config, run_agent() job loop
-  llm.rs         # LLM client (Anthropic/OpenAI HTTP calls)
-  dashboard.rs   # DashboardState struct (TUI stub for ratatui)
-  banner.rs      # ASCII art banner
-  error.rs       # CliError enum
+  main.rs              # Entry point → cli::run()
+  cli/
+    mod.rs             # Command dispatch, init wizard, config editor
+    args.rs            # Clap derive structs (Cli, Commands)
+    config.rs          # AgentConfig TOML load/save
+    agent.rs           # Agent node builder, provider job loop, payment flow
+    customer.rs        # Customer REPL: discovery, scoring, job submission
+    llm.rs             # LLM client (Anthropic + OpenAI APIs)
+    protocol.rs        # Heartbeat messages (ping/pong)
+    dashboard.rs       # TUI state (stub for ratatui)
+    banner.rs          # ASCII art banner
+    error.rs           # CliError enum
 ```
 
 ## Job Flow
 
 ```
-Client                          Agent
-  |                               |
-  |-- NIP-90 job request -------->|
-  |                               |-- generate Lightning invoice
-  |<-- PaymentRequired + invoice -|
-  |                               |
-  |-- pay invoice (Lightning) --->|
-  |                               |-- verify payment
-  |                               |-- call LLM
-  |<-- job result + receipt ------|
+Customer                              Provider
+  │                                      │
+  │── NIP-90 job request ──────────────▶│
+  │                                      │── create Solana payment request
+  │◀── PaymentRequired + invoice ───────│
+  │                                      │
+  │── pay on Solana ───────────────────▶│
+  │                                      │── verify payment on-chain
+  │                                      │── call LLM with system prompt
+  │◀── job result ─────────────────────│
+```
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `RUST_LOG` | Log level filter (default: `info`). Nostr relay pool logs are suppressed. |
+
+## Data Directory
+
+```
+~/.elisym/
+  agents/
+    <name>/
+      config.toml     # agent configuration
 ```
 
 ## License
