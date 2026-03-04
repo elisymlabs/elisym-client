@@ -153,8 +153,8 @@ pub async fn run() -> Result<()> {
         None => {
             // No subcommand — show banner and help
             print!("{}", banner::BANNER);
-            println!("  Run {} to get started.\n", style("elisym-client init").cyan());
-            Cli::parse_from(["elisym-client", "--help"]);
+            println!("  Run {} to get started.\n", style("elisym init").cyan());
+            Cli::parse_from(["elisym", "--help"]);
         }
     }
 
@@ -454,10 +454,10 @@ fn cmd_init() -> Result<()> {
     if network != "mainnet" {
         println!(
             "\n  Run command to get devnet SOL: {}",
-            style(format!("elisym-client airdrop {}", name)).cyan()
+            style(format!("elisym airdrop {}", name)).cyan()
         );
     }
-    println!("  Start agent:    {}\n", style(format!("elisym-client start {}", name)).cyan());
+    println!("  Start agent:    {}\n", style(format!("elisym start {}", name)).cyan());
 
     Ok(())
 }
@@ -705,7 +705,7 @@ async fn prompt_capabilities_llm(config: &AgentConfig) -> Result<Vec<(String, St
     let llm_section = config
         .llm
         .as_ref()
-        .ok_or_else(|| CliError::Llm("no LLM configured — run `elisym-client init` to set up".into()))?;
+        .ok_or_else(|| CliError::Llm("no LLM configured — run `elisym init` to set up".into()))?;
     let llm = llm::LlmClient::new(llm_section)?;
 
     let description: String = Input::new()
@@ -837,7 +837,7 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
             println!(
                 "\n  {} Wallet is empty. Get devnet SOL: {}",
                 style("!").yellow(),
-                style(format!("elisym-client airdrop {}", name)).cyan()
+                style(format!("elisym airdrop {}", name)).cyan()
             );
         }
     }
@@ -940,7 +940,7 @@ fn select_or_create_agent() -> Result<String> {
 fn cmd_list() -> Result<()> {
     let agents = config::list_agents()?;
     if agents.is_empty() {
-        println!("No agents configured. Run {} to create one.", style("elisym-client init").cyan());
+        println!("No agents configured. Run {} to create one.", style("elisym init").cyan());
         return Ok(());
     }
 
