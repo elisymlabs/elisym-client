@@ -1,0 +1,32 @@
+[package]
+name = "elisym-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+description = "CLI agent runner for the elisym protocol"
+license = "MIT"
+repository = "https://github.com/elisymprotocol/elisym-cli"
+
+[[bin]]
+name = "elisym-cli"
+path = "src/main.rs"
+
+[dependencies]
+elisym-core = { version = "0.5", path = "../elisym-core", features = ["payments-solana"] }
+clap = { version = "4", features = ["derive"] }
+dialoguer = "0.11"
+console = "0.15"
+ratatui = "0.29"
+crossterm = "0.28"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+solana-sdk = "2.2"
+bs58 = "0.5"
+nostr-sdk = "0.37"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1"
+dirs = "6"
