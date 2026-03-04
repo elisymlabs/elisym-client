@@ -17,6 +17,8 @@ use solana_sdk::signer::Signer;
 use tracing::info;
 
 use crate::cli::{Cli, Commands};
+use std::collections::HashMap;
+
 use crate::config::{AgentConfig, LlmSection, PaymentSection};
 use crate::error::{CliError, Result};
 
@@ -401,6 +403,8 @@ fn cmd_init() -> Result<()> {
             payment_timeout_secs: 120,
             solana_secret_key,
         },
+        inactive_capabilities: vec![],
+        capability_prompts: HashMap::new(),
         llm: Some(llm_section),
         customer_llm: None,
     };
@@ -459,34 +463,109 @@ fn cmd_config(name: &str) -> Result<()> {
                     match sub_idx {
                         // Capabilities
                         0 => {
-                            let cap_options = &[
-                                "summarization",
-                                "translation",
-                                "code-generation",
-                                "image-generation",
-                                "data-analysis",
-                                "research",
-                            ];
-                            // Pre-select current capabilities
-                            let defaults: Vec<bool> = cap_options
-                                .iter()
-                                .map(|c| cfg.capabilities.contains(&c.to_string()))
-                                .collect();
-                            let selections = MultiSelect::new()
-                                .with_prompt("Capabilities (space to select, enter to confirm)")
-                                .items(cap_options)
-                                .defaults(&defaults)
-                                .interact()?;
-                            cfg.capabilities = if selections.is_empty() {
-                                vec!["general".to_string()]
+                            let has_real_caps = cfg.capabilities != ["general"]
+                                || !cfg.inactive_capabilities.is_empty();
+
+                            if !has_real_caps {
+                                // No real capabilities — directly offer LLM describe
+                                let caps = prompt_capabilities_llm_sync(&cfg)?;
+                                if !caps.is_empty() {
+                                    cfg.capabilities = caps.iter().map(|(n, _)| n.clone()).collect();
+                                    for (n, p) in &caps {
+                                        cfg.capability_prompts.insert(n.clone(), p.clone());
+                                    }
+                                    println!(
+                                        "  {} Capabilities: {}",
+                                        style("*").green(),
+                                        cfg.capabilities.join(", ")
+                                    );
+                                }
                             } else {
-                                selections.iter().map(|&i| cap_options[i].to_string()).collect()
-                            };
-                            println!(
-                                "  {} Capabilities: {}",
-                                style("*").green(),
-                                cfg.capabilities.join(", ")
-                            );
+                                // Has real capabilities — show submenu
+                                let cap_sub = &["Toggle capabilities", "Add capabilities (describe)", "\u{2190} Back"];
+                                let cap_idx = Select::new()
+                                    .with_prompt("Capabilities")
+                                    .items(cap_sub)
+                                    .default(0)
+                                    .interact()?;
+
+                                match cap_idx {
+                                    // Toggle
+                                    0 => {
+                                        let all_caps: Vec<String> = cfg
+                                            .capabilities
+                                            .iter()
+                                            .chain(cfg.inactive_capabilities.iter())
+                                            .cloned()
+                                            .collect();
+                                        let defaults: Vec<bool> = all_caps
+                                            .iter()
+                                            .map(|c| cfg.capabilities.contains(c))
+                                            .collect();
+                                        let selections = MultiSelect::new()
+                                            .with_prompt("Capabilities (space to toggle, enter to confirm)")
+                                            .items(&all_caps)
+                                            .defaults(&defaults)
+                                            .interact()?;
+
+                                        let selected: Vec<String> = selections
+                                            .iter()
+                                            .map(|&i| all_caps[i].clone())
+                                            .collect();
+                                        let inactive: Vec<String> = all_caps
+                                            .iter()
+                                            .filter(|c| !selected.contains(c))
+                                            .cloned()
+                                            .collect();
+
+                                        cfg.capabilities = if selected.is_empty() {
+                                            vec!["general".to_string()]
+                                        } else {
+                                            selected
+                                        };
+                                        cfg.inactive_capabilities = inactive;
+                                        // Prompts preserved in capability_prompts for both
+
+                                        println!(
+                                            "  {} Active: {}",
+                                            style("*").green(),
+                                            cfg.capabilities.join(", ")
+                                        );
+                                        if !cfg.inactive_capabilities.is_empty() {
+                                            println!(
+                                                "  {} Inactive: {}",
+                                                style("~").dim(),
+                                                cfg.inactive_capabilities.join(", ")
+                                            );
+                                        }
+                                    }
+                                    // Add via describe
+                                    1 => {
+                                        let caps = prompt_capabilities_llm_sync(&cfg)?;
+                                        for (n, p) in caps {
+                                            if !cfg.capabilities.contains(&n)
+                                                && !cfg.inactive_capabilities.contains(&n)
+                                            {
+                                                cfg.capabilities.push(n.clone());
+                                                cfg.capability_prompts.insert(n, p);
+                                            } else {
+                                                println!(
+                                                    "  {} Skipped duplicate: {}",
+                                                    style("~").dim(),
+                                                    n
+                                                );
+                                            }
+                                        }
+                                        println!(
+                                            "  {} Capabilities: {}",
+                                            style("*").green(),
+                                            cfg.capabilities.join(", ")
+                                        );
+                                    }
+                                    // Back
+                                    _ => {}
+                                }
+                            }
                         }
                         // LLM provider
                         1 => {
@@ -532,6 +611,7 @@ fn cmd_config(name: &str) -> Result<()> {
         style("*").green(),
         style(name).cyan()
     );
+    println!("  Restart agent to publish updated capabilities.");
 
     Ok(())
 }
@@ -588,6 +668,93 @@ fn prompt_llm_section() -> Result<Option<LlmSection>> {
     }))
 }
 
+// ── capability LLM helper ─────────────────────────────────────────────
+
+/// Ask the user to describe what the agent does, then call the LLM to extract
+/// capabilities and generate a system prompt for each.
+/// Returns a Vec of (capability_name, capability_prompt) pairs, or empty if the user backs out.
+async fn prompt_capabilities_llm(config: &AgentConfig) -> Result<Vec<(String, String)>> {
+    let llm_section = config
+        .llm
+        .as_ref()
+        .ok_or_else(|| CliError::Llm("no LLM configured — run `elisym-cli init` to set up".into()))?;
+    let llm = crate::llm::LlmClient::new(llm_section)?;
+
+    let description: String = Input::new()
+        .with_prompt("Describe what your agent can do (or \"back\")")
+        .interact_text()?;
+
+    if description.eq_ignore_ascii_case("back") {
+        return Ok(vec![]);
+    }
+
+    println!("  {} Analyzing capabilities...", style("~").dim());
+
+    let system = "You help AI agents define their capabilities for a marketplace.\n\
+        Given a description of what an agent can do, return a JSON object with:\n\
+        - \"capabilities\": array of objects, each with:\n\
+          - \"name\": short capability keyword (lowercase, hyphenated, e.g. \"code-generation\")\n\
+          - \"prompt\": a detailed system prompt (2-4 sentences) that instructs an AI to excel at this capability\n\
+        Return 3-8 capabilities. Return ONLY the JSON, no other text.";
+
+    let response = llm.complete(system, &description).await?;
+
+    // Parse JSON from LLM response (handle possible markdown fencing)
+    let json_str = response
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    let parsed: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+        CliError::Llm(format!("failed to parse LLM response as JSON: {}", e))
+    })?;
+
+    let caps = parsed["capabilities"]
+        .as_array()
+        .ok_or_else(|| CliError::Llm("LLM response missing 'capabilities' array".into()))?;
+
+    let mut results: Vec<(String, String)> = Vec::new();
+    for cap in caps {
+        let name = cap["name"].as_str().unwrap_or_default().to_string();
+        let prompt = cap["prompt"].as_str().unwrap_or_default().to_string();
+        if !name.is_empty() && !prompt.is_empty() {
+            results.push((name, prompt));
+        }
+    }
+
+    if results.is_empty() {
+        println!("  {} No capabilities extracted. Try again with more detail.", style("!").yellow());
+        return Ok(vec![]);
+    }
+
+    // Display detected capabilities
+    println!("\n  {} Detected capabilities:\n", style("*").green());
+    for (name, prompt) in &results {
+        println!("  {} {}", style(name).cyan().bold(), style("—").dim());
+        println!("    {}\n", style(prompt).dim());
+    }
+
+    let confirmed = Confirm::new()
+        .with_prompt("Use these capabilities?")
+        .default(true)
+        .interact()?;
+
+    if !confirmed {
+        return Ok(vec![]);
+    }
+
+    Ok(results)
+}
+
+/// Sync wrapper for `prompt_capabilities_llm`, for use inside `cmd_config`.
+fn prompt_capabilities_llm_sync(config: &AgentConfig) -> Result<Vec<(String, String)>> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(prompt_capabilities_llm(config))
+    })
+}
+
 // ── start ─────────────────────────────────────────────────────────────
 
 async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
@@ -596,7 +763,7 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
         None => select_or_create_agent()?,
     };
 
-    let cfg = config::load_config(&name)?;
+    let mut cfg = config::load_config(&name)?;
 
     print!("{}", banner::BANNER);
     println!("  Starting agent {}...\n", style(&name).cyan().bold());
@@ -608,25 +775,21 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
         );
     }
 
-    info!(agent = %name, "building agent node");
-    let agent = agent::build_agent(&cfg).await?;
+    // Show wallet status (no relay connection needed)
+    let solana = agent::build_solana_provider(&cfg)?;
+    display_wallet_status(&solana, &cfg)?;
 
-    info!(agent = %name, npub = %agent.identity.npub(), "agent node ready");
-
-    if let Some(solana) = agent.solana_payments() {
-        display_wallet_status(solana, &cfg)?;
-
-        if !free {
-            let balance = solana.balance().unwrap_or(0);
-            if balance == 0 && cfg.payment.network != "mainnet" {
-                println!(
-                    "\n  {} Wallet is empty. Get devnet SOL: {}",
-                    style("!").yellow(),
-                    style(format!("elisym-cli airdrop {}", name)).cyan()
-                );
-            }
+    if !free {
+        let balance = solana.balance().unwrap_or(0);
+        if balance == 0 && cfg.payment.network != "mainnet" {
+            println!(
+                "\n  {} Wallet is empty. Get devnet SOL: {}",
+                style("!").yellow(),
+                style(format!("elisym-cli airdrop {}", name)).cyan()
+            );
         }
     }
+    drop(solana);
 
     // Mode selection
     let mode_options = &["Provider (listen for jobs)", "Customer (send requests)"];
@@ -639,9 +802,30 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
     println!();
 
     match mode_idx {
+        // Provider mode
         0 => {
+            // First-time capability setup: if only "general" and no inactive caps
+            if cfg.capabilities == ["general"] && cfg.inactive_capabilities.is_empty() {
+                let caps = prompt_capabilities_llm(&cfg).await?;
+                if !caps.is_empty() {
+                    cfg.capabilities = caps.iter().map(|(name, _)| name.clone()).collect();
+                    for (name, prompt) in &caps {
+                        cfg.capability_prompts.insert(name.clone(), prompt.clone());
+                    }
+                    config::save_config(&cfg)?;
+                    println!(
+                        "  {} Capabilities saved. Publishing to network...\n",
+                        style("*").green()
+                    );
+                }
+            }
+
+            info!(agent = %name, "building agent node");
+            let agent = agent::build_agent(&cfg).await?;
+            info!(agent = %name, npub = %agent.identity.npub(), "agent node ready");
             agent::run_agent(agent, &cfg, free).await?;
         }
+        // Customer mode
         _ => {
             if free {
                 println!(
@@ -649,6 +833,9 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
                     style("!").yellow()
                 );
             }
+            info!(agent = %name, "building agent node");
+            let agent = agent::build_agent(&cfg).await?;
+            info!(agent = %name, npub = %agent.identity.npub(), "agent node ready");
             customer::run_customer_repl(agent, &cfg).await?;
         }
     }

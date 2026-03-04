@@ -86,17 +86,23 @@ pub async fn build_agent(config: &AgentConfig) -> Result<AgentNode> {
     Ok(agent)
 }
 
-/// Build a system prompt from the agent config.
+/// Build a system prompt from the agent config, including per-capability prompts.
 fn build_system_prompt(config: &AgentConfig) -> String {
-    format!(
+    let mut prompt = format!(
         "You are {}, an AI agent on the elisym protocol.\n\
-         Description: {}\n\
-         Capabilities: {}\n\
-         Process the user's request. Be concise and helpful.",
-        config.name,
-        config.description,
-        config.capabilities.join(", ")
-    )
+         Description: {}\n\n",
+        config.name, config.description
+    );
+
+    // Append per-capability instructions (only active capabilities)
+    for cap in &config.capabilities {
+        if let Some(cap_prompt) = config.capability_prompts.get(cap) {
+            prompt.push_str(&format!("[{}]: {}\n\n", cap, cap_prompt));
+        }
+    }
+
+    prompt.push_str("Process the user's request. Be concise and helpful.");
+    prompt
 }
 
 /// Run the agent's job processing loop with payment-first flow and parallel execution.

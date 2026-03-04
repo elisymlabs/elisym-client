@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -13,6 +14,10 @@ pub struct AgentConfig {
     pub relays: Vec<String>,
     pub secret_key: String,
     pub payment: PaymentSection,
+    #[serde(default)]
+    pub inactive_capabilities: Vec<String>,
+    #[serde(default)]
+    pub capability_prompts: HashMap<String, String>,
     #[serde(default)]
     pub llm: Option<LlmSection>,
     #[serde(default)]
