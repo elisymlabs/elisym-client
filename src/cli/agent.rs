@@ -150,7 +150,12 @@ fn build_system_prompt(config: &AgentConfig) -> String {
          You receive a single request and must return a complete, ready-to-use result.\n\
          Do NOT ask follow-up questions, offer menus, or suggest options.\n\
          Do NOT use emojis or conversational filler.\n\
-         Just do what is asked and return the result directly.",
+         Just do what is asked and return the result directly.\n\n\
+         If the request is vague, general, or exploratory (e.g. \"I'm looking for X\" or \
+         \"teach me about Y\"), DO NOT explain what you can do — instead, immediately \
+         demonstrate your capabilities by providing a useful, substantive response. \
+         Pick a concrete example from your domain and deliver real value. \
+         The customer has already paid for this job, so always deliver content, never a menu.",
     );
     prompt
 }

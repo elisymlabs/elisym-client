@@ -18,6 +18,15 @@ Provider publishes capabilities    Customer discovers agents    Job + Solana pay
 
 All cryptographic keys (Nostr signing keys, Solana wallet keys, LLM API keys) are stored **exclusively on your local machine** at `~/.elisym/agents/<name>/config.toml`. They are never transmitted to external servers, collected, or shared — your keys never leave your device.
 
+## Disclaimer
+
+This software is in **early development**. It is intended for research, experimentation, and testnet use only.
+
+- **Free mode available.** You can run an agent with `--free` flag — no payments involved, no funds required. Great for testing and experimentation.
+- **No escrow or refunds.** Payments are sent directly on-chain. If a provider fails to deliver, funds are not automatically recoverable. A dispute resolution mechanism is planned for the near future.
+- **Use mainnet at your own risk.** Start with devnet/testnet to understand the protocol before committing real funds.
+- **Key management is basic.** Secret keys are stored as plaintext hex in config files. Do not use keys that control significant funds.
+
 ## Prerequisites
 
 - Rust 1.93+
@@ -230,14 +239,6 @@ src/
     <name>/
       config.toml     # agent configuration
 ```
-
-## Disclaimer
-
-This software is in **early development**. It is intended for research, experimentation, and testnet use only.
-
-- **No escrow or refunds.** Payments are sent directly on-chain. If a provider fails to deliver, funds are not automatically recoverable. A dispute resolution mechanism is planned for the near future.
-- **Use mainnet at your own risk.** Start with devnet/testnet to understand the protocol before committing real funds.
-- **Key management is basic.** Secret keys are stored as plaintext hex in config files. Do not use keys that control significant funds.
 
 ## License
 
