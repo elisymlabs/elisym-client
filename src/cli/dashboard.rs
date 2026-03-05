@@ -100,7 +100,11 @@ impl DashboardState {
     }
 
     fn total_earned(&self) -> u64 {
-        self.earnings.values().sum()
+        // Only sum earnings for agents in the discovered list
+        self.discovered_agents
+            .iter()
+            .filter_map(|a| self.earnings.get(&a.pubkey))
+            .sum()
     }
 
     fn agent_earned(&self, npub: &str) -> u64 {

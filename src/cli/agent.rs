@@ -428,7 +428,7 @@ async fn process_job(
     for attempt in 0..3 {
         match agent
             .marketplace
-            .submit_job_result(&job.raw_event, &result, Some(price))
+            .submit_job_result(&job.raw_event, &result, Some(provider_net))
             .await
         {
             Ok(result_id) => {
