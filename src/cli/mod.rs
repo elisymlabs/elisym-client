@@ -8,6 +8,13 @@ pub(crate) mod error;
 mod llm;
 mod protocol;
 
+/// Protocol fee in basis points (300 = 3%). Integer-only arithmetic.
+pub(crate) const PROTOCOL_FEE_BPS: u64 = 300;
+/// Solana address of the protocol treasury.
+pub(crate) const PROTOCOL_TREASURY: &str = "GY7vnWMkKpftU4nQ16C2ATkj1JwrQpHhknkaBUn67VTy";
+/// Solana rent-exempt minimum for a 0-data account (lamports).
+pub(crate) const RENT_EXEMPT_MINIMUM: u64 = 890_880;
+
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::Arc;

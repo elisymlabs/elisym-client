@@ -22,6 +22,7 @@ use super::config::AgentConfig;
 use super::error::{CliError, Result};
 use super::llm::LlmClient;
 use super::protocol::{self, HeartbeatMessage};
+use super::{PROTOCOL_FEE_BPS, PROTOCOL_TREASURY};
 
 enum RequestOutcome {
     Done,
@@ -560,6 +561,40 @@ async fn handle_request_inner(
                                 }
                             } else {
                                 println!("  {} Payment required — paying...", style("$").yellow());
+                            }
+
+                            // Validate fee parameters before paying.
+                            // A malicious provider could embed arbitrary fee_address / fee_amount
+                            // to redirect funds. We enforce the expected protocol treasury and cap.
+                            if let Ok(req_check) = serde_json::from_str::<Value>(pay_req) {
+                                if let Some(fee_addr) = req_check["fee_address"].as_str() {
+                                    if fee_addr != PROTOCOL_TREASURY {
+                                        println!(
+                                            "  {} Rejected: fee_address {} does not match protocol treasury\n",
+                                            style("!").red(),
+                                            fee_addr,
+                                        );
+                                        break;
+                                    }
+                                }
+                                if let (Some(fee_amt), Some(total)) = (
+                                    req_check["fee_amount"].as_u64(),
+                                    req_check["amount"].as_u64(),
+                                ) {
+                                    // Allow up to PROTOCOL_FEE_BPS + 1 bps tolerance for rounding
+                                    let max_fee = (total * (PROTOCOL_FEE_BPS + 1)).div_ceil(10_000);
+                                    if fee_amt > max_fee {
+                                        println!(
+                                            "  {} Rejected: fee {} exceeds expected max {} ({}bps of {})\n",
+                                            style("!").red(),
+                                            fee_amt,
+                                            max_fee,
+                                            PROTOCOL_FEE_BPS,
+                                            total,
+                                        );
+                                        break;
+                                    }
+                                }
                             }
 
                             let payments = match agent.payments.as_ref() {

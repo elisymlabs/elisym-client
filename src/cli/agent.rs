@@ -5,17 +5,12 @@ use elisym_core::marketplace::JobRequest;
 use elisym_core::messaging::PrivateMessage;
 use elisym_core::types::JobStatus;
 use elisym_core::{
-    AgentNode, AgentNodeBuilder, FeeConfig, PaymentChain,
+    AgentNode, AgentNodeBuilder,
     SolanaPaymentConfig, SolanaPaymentProvider, SolanaNetwork, SolanaToken,
     USDC_MINT_DEVNET, USDC_MINT_MAINNET,
 };
 
-/// Protocol fee in basis points (300 = 3%). Integer-only arithmetic.
-const PROTOCOL_FEE_BPS: u64 = 300;
-/// Solana address of the protocol treasury.
-const PROTOCOL_TREASURY: &str = "GY7vnWMkKpftU4nQ16C2ATkj1JwrQpHhknkaBUn67VTy";
-/// Solana rent-exempt minimum for a 0-data account (lamports).
-const RENT_EXEMPT_MINIMUM: u64 = 890_880;
+use super::{PROTOCOL_FEE_BPS, PROTOCOL_TREASURY, RENT_EXEMPT_MINIMUM};
 
 /// Validate that the provider's net amount (price minus protocol fee) is above
 /// Solana's rent-exempt minimum. Returns an error message if invalid, None if OK.
@@ -78,16 +73,10 @@ pub fn build_solana_provider(config: &AgentConfig) -> Result<SolanaPaymentProvid
         token,
     };
 
-    let mut provider = SolanaPaymentProvider::from_secret_key(
+    let provider = SolanaPaymentProvider::from_secret_key(
         solana_config,
         &config.payment.solana_secret_key,
     )?;
-
-    provider.set_fee_config(FeeConfig {
-        app_fee_bps: PROTOCOL_FEE_BPS,
-        app_fee_address: PROTOCOL_TREASURY.to_string(),
-        app_fee_chain: PaymentChain::Solana,
-    });
 
     Ok(provider)
 }
@@ -309,10 +298,18 @@ async fn process_job(
         .as_ref()
         .ok_or_else(|| CliError::Other("payments not configured".into()))?;
 
-    let payment_request = match payments.create_payment_request(
+    let fee_amount = (price * PROTOCOL_FEE_BPS).div_ceil(10_000);
+
+    let solana = agent
+        .solana_payments()
+        .ok_or_else(|| CliError::Other("solana payments not configured".into()))?;
+
+    let payment_request = match solana.create_payment_request_with_fee(
         price,
         &format!("elisym job {}", job_id),
         payment_timeout_secs,
+        PROTOCOL_TREASURY,
+        fee_amount,
     ) {
         Ok(req) => req,
         Err(e) => {
@@ -333,7 +330,6 @@ async fn process_job(
     };
 
     let chain_str = payment_request.chain.to_string();
-    let fee_amount = (price * PROTOCOL_FEE_BPS).div_ceil(10_000);
     let provider_net = price.saturating_sub(fee_amount);
     info!(
         job_id = %job_id,
