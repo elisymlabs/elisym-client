@@ -451,7 +451,6 @@ fn cmd_init() -> Result<()> {
             chain: "solana".to_string(),
             network: network.clone(),
             rpc_url: rpc_url_opt,
-            token: "sol".to_string(),
             job_price: 10_000_000, // 0.01 SOL default
             payment_timeout_secs: 120,
             solana_secret_key,
@@ -1070,20 +1069,11 @@ fn cmd_status(name: &str) -> Result<()> {
     println!("  relays:       {}", cfg.relays.join(", "));
     println!("  chain:        {}", cfg.payment.chain);
     println!("  network:      {}", cfg.payment.network);
-    println!("  token:        {}", cfg.payment.token);
-    if cfg.payment.token == "sol" {
-        println!(
-            "  job price:    {} SOL ({} lamports)",
-            format_sol(cfg.payment.job_price),
-            cfg.payment.job_price
-        );
-    } else {
-        println!(
-            "  job price:    {} USDC ({} base units)",
-            format_usdc(cfg.payment.job_price),
-            cfg.payment.job_price
-        );
-    }
+    println!(
+        "  job price:    {} SOL ({} lamports)",
+        format_sol(cfg.payment.job_price),
+        cfg.payment.job_price
+    );
     if let Some(addr) = cfg.payment.solana_address() {
         println!("  wallet:       {}", addr);
     }
@@ -1178,17 +1168,9 @@ fn cmd_send(name: &str, address: &str, amount: f64) -> Result<()> {
 
     let solana = agent::build_solana_provider(&cfg)?;
 
-    // Convert amount to base units
-    let (base_amount, unit_label) = match cfg.payment.token.as_str() {
-        "usdc" => {
-            let base = (amount * 1_000_000.0) as u64; // 6 decimals
-            (base, "USDC")
-        }
-        _ => {
-            let base = (amount * 1_000_000_000.0) as u64; // 9 decimals (lamports)
-            (base, "SOL")
-        }
-    };
+    // Convert SOL to lamports
+    let base_amount = (amount * 1_000_000_000.0) as u64;
+    let unit_label = "SOL";
 
     // Show current balance
     let balance = solana.balance().unwrap_or(0);
@@ -1210,23 +1192,11 @@ fn cmd_send(name: &str, address: &str, amount: f64) -> Result<()> {
         return Ok(());
     }
 
-    // Construct the request JSON matching SolanaPaymentRequestData format
-    let mint_info = match cfg.payment.token.as_str() {
-        "usdc" => {
-            let mint = match cfg.payment.network.as_str() {
-                "mainnet" => elisym_core::USDC_MINT_MAINNET,
-                _ => elisym_core::USDC_MINT_DEVNET,
-            };
-            format!(r#","mint":"{}","decimals":6"#, mint)
-        }
-        _ => String::new(),
-    };
-
     // Use a dummy reference key (not needed for direct sends, but required by the format)
     let reference = Keypair::new().pubkey().to_string();
     let request_json = format!(
-        r#"{{"recipient":"{}","amount":{},"reference":"{}"{}}}"#,
-        address, base_amount, reference, mint_info
+        r#"{{"recipient":"{}","amount":{},"reference":"{}"}}"#,
+        address, base_amount, reference
     );
 
     use elisym_core::PaymentProvider;
@@ -1266,22 +1236,12 @@ fn display_wallet_status(solana: &elisym_core::SolanaPaymentProvider, cfg: &Agen
 
     println!("\n  {}", style("Solana Wallet").bold().underlined());
     println!("  Network:  {}", style(&cfg.payment.network).dim());
-    println!("  Token:    {}", style(&cfg.payment.token).dim());
     println!("  Address:  {}", style(&address).dim());
     println!(
         "  Balance:  {} SOL ({} lamports)",
         style(format_sol(balance)).green(),
         balance
     );
-
-    if cfg.payment.token == "usdc" {
-        let token_balance = solana.token_balance().unwrap_or(0);
-        println!(
-            "  USDC:     {} ({} base units)",
-            style(format_usdc(token_balance)).green(),
-            token_balance
-        );
-    }
 
     Ok(())
 }
@@ -1294,8 +1254,4 @@ async fn cmd_dashboard(chain: &str, network: &str, rpc_url: Option<String>) -> R
 
 fn format_sol(lamports: u64) -> String {
     format!("{:.9}", lamports as f64 / 1_000_000_000.0)
-}
-
-fn format_usdc(base_units: u64) -> String {
-    format!("{:.6}", base_units as f64 / 1_000_000.0)
 }

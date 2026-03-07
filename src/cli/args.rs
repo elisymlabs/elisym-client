@@ -57,13 +57,13 @@ pub enum Commands {
         amount: f64,
     },
 
-    /// Send SOL or tokens to an address
+    /// Send SOL to an address
     Send {
         /// Agent name
         name: String,
         /// Destination Solana address
         address: String,
-        /// Amount to send (in SOL or USDC depending on agent config)
+        /// Amount to send (in SOL)
         amount: f64,
     },
 

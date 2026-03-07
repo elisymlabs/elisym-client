@@ -32,7 +32,6 @@ struct AgentEntry {
     capabilities: Vec<String>,
     description: String,
     price: u64,
-    token: String,
     chain: String,
     network: String,
     solana_address: Option<String>,
@@ -385,11 +384,7 @@ fn render_agents_list(frame: &mut ratatui::Frame, area: Rect, state: &DashboardS
         .skip(viewport_start)
         .take(content_height)
         .map(|(i, a)| {
-            let price_str = if a.token == "usdc" {
-                format!("{:.6} USDC", a.price as f64 / 1e6)
-            } else {
-                format!("{:.4} SOL", a.price as f64 / 1e9)
-            };
+            let price_str = format!("{:.4} SOL", a.price as f64 / 1e9);
             let agent_earned = state.agent_earned(&a.pubkey);
             let earned_str = if agent_earned > 0 {
                 format!("{:.4}", agent_earned as f64 / 1e9)
@@ -504,11 +499,7 @@ fn render_detail(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState)
     lines.push(Line::raw(""));
 
     // Price
-    let price_str = if agent.token == "usdc" {
-        format!("{:.6} USDC", agent.price as f64 / 1e6)
-    } else {
-        format!("{:.4} SOL", agent.price as f64 / 1e9)
-    };
+    let price_str = format!("{:.4} SOL", agent.price as f64 / 1e9);
     lines.push(Line::from(vec![
         Span::styled("  Price         ", Style::default().fg(Color::DarkGray)),
         Span::styled(price_str, Style::default().fg(Color::Green)),
@@ -716,7 +707,7 @@ fn spawn_discovery(
                             continue;
                         }
 
-                        let (price, token) = extract_price(&a);
+                        let price = extract_price(&a);
                         let npub_str = a.pubkey.to_bech32().unwrap_or_default();
                         let entry = AgentEntry {
                             name: a.card.name.clone(),
@@ -724,7 +715,6 @@ fn spawn_discovery(
                             capabilities: a.card.capabilities.clone(),
                             description: a.card.description.clone(),
                             price,
-                            token,
                             chain: agent_chain,
                             network: agent_network,
                             solana_address: a.card.payment_address.clone(),
@@ -801,7 +791,7 @@ fn spawn_job_results(
     tx: mpsc::Sender<DashboardEvent>,
 ) {
     tokio::spawn(async move {
-        let result_kind = Kind::from(elisym_core::KIND_JOB_RESULT_BASE + 100);
+        let result_kind = Kind::from(elisym_core::KIND_JOB_RESULT_BASE + elisym_core::DEFAULT_KIND_OFFSET);
         let mut seen = HashSet::new();
         let mut interval = tokio::time::interval(Duration::from_secs(15));
 
@@ -964,13 +954,11 @@ fn extract_network(agent: &elisym_core::DiscoveredAgent) -> String {
         .to_string()
 }
 
-fn extract_price(agent: &elisym_core::DiscoveredAgent) -> (u64, String) {
+fn extract_price(agent: &elisym_core::DiscoveredAgent) -> u64 {
     if let Some(ref meta) = agent.card.metadata {
-        let price = meta["job_price"].as_u64().unwrap_or(0);
-        let token = meta["token"].as_str().unwrap_or("sol").to_string();
-        (price, token)
+        meta["job_price"].as_u64().unwrap_or(0)
     } else {
-        (0, "sol".to_string())
+        0
     }
 }
 

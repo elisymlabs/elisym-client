@@ -44,7 +44,6 @@ pub struct PaymentSection {
     pub network: String,
     #[serde(default)]
     pub rpc_url: Option<String>,
-    pub token: String,
     pub job_price: u64,
     pub payment_timeout_secs: u32,
     pub solana_secret_key: String,
@@ -56,7 +55,6 @@ impl Default for PaymentSection {
             chain: "solana".to_string(),
             network: "mainnet".to_string(),
             rpc_url: None,
-            token: "sol".to_string(),
             job_price: 10_000_000, // 0.01 SOL in lamports
             payment_timeout_secs: 120,
             solana_secret_key: String::new(),

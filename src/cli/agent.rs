@@ -6,8 +6,7 @@ use elisym_core::messaging::PrivateMessage;
 use elisym_core::types::JobStatus;
 use elisym_core::{
     AgentNode, AgentNodeBuilder,
-    SolanaPaymentConfig, SolanaPaymentProvider, SolanaNetwork, SolanaToken,
-    USDC_MINT_DEVNET, USDC_MINT_MAINNET,
+    SolanaPaymentConfig, SolanaPaymentProvider, SolanaNetwork,
 };
 
 use super::{PROTOCOL_FEE_BPS, PROTOCOL_TREASURY, RENT_EXEMPT_MINIMUM};
@@ -33,7 +32,6 @@ pub fn validate_job_price(lamports: u64) -> Option<String> {
     }
 }
 use nostr_sdk::Timestamp;
-use solana_sdk::pubkey::Pubkey;
 use tokio::task::JoinSet;
 use tracing::{error, info, trace, warn};
 
@@ -53,24 +51,9 @@ pub fn build_solana_provider(config: &AgentConfig) -> Result<SolanaPaymentProvid
         other => SolanaNetwork::Custom(other.to_string()),
     };
 
-    let token = match config.payment.token.as_str() {
-        "usdc" => {
-            let mint_str = match &config.payment.network as &str {
-                "mainnet" => USDC_MINT_MAINNET,
-                _ => USDC_MINT_DEVNET,
-            };
-            let mint: Pubkey = mint_str.parse().map_err(|e| {
-                CliError::Other(format!("invalid USDC mint address: {:?}", e))
-            })?;
-            SolanaToken::Spl { mint, decimals: 6 }
-        }
-        _ => SolanaToken::Sol,
-    };
-
     let solana_config = SolanaPaymentConfig {
         network,
         rpc_url: config.payment.rpc_url.clone(),
-        token,
     };
 
     let provider = SolanaPaymentProvider::from_secret_key(
@@ -89,7 +72,7 @@ pub async fn build_agent(config: &AgentConfig) -> Result<AgentNode> {
     let mut agent = AgentNodeBuilder::new(&config.name, &config.description)
         .capabilities(config.capabilities.clone())
         .relays(config.relays.clone())
-        .supported_job_kinds(vec![5100])
+        .supported_job_kinds(vec![elisym_core::KIND_JOB_REQUEST_BASE + elisym_core::DEFAULT_KIND_OFFSET])
         .secret_key(&config.secret_key)
         .solana_payment_provider(provider)
         .build()
@@ -106,14 +89,13 @@ pub async fn build_agent(config: &AgentConfig) -> Result<AgentNode> {
     // Publish capability card with pricing metadata
     agent.capability_card.metadata = Some(serde_json::json!({
         "job_price": config.payment.job_price,
-        "token": config.payment.token,
         "chain": config.payment.chain,
         "network": config.payment.network,
         "protocol_fee_bps": PROTOCOL_FEE_BPS,
     }));
     agent
         .discovery
-        .publish_capability(&agent.capability_card, &[5100])
+        .publish_capability(&agent.capability_card, &[elisym_core::KIND_JOB_REQUEST_BASE + elisym_core::DEFAULT_KIND_OFFSET])
         .await?;
 
     Ok(agent)
@@ -167,12 +149,12 @@ pub async fn run_agent(agent: AgentNode, config: &AgentConfig, free_mode: bool) 
         npub = %agent.identity.npub(),
         free_mode,
         "agent is live — listening for jobs on kind {}",
-        5100
+        elisym_core::KIND_JOB_REQUEST_BASE + elisym_core::DEFAULT_KIND_OFFSET
     );
 
     let mut jobs_rx = agent
         .marketplace
-        .subscribe_to_job_requests(&[100])
+        .subscribe_to_job_requests(&[elisym_core::DEFAULT_KIND_OFFSET])
         .await?;
 
     let mut messages_rx = agent.messaging.subscribe_to_messages().await?;

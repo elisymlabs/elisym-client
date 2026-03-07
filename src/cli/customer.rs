@@ -404,7 +404,7 @@ async fn handle_request_inner(
     let mut select_items: Vec<String> = Vec::new();
     for (i, sp) in online_scored.iter().enumerate() {
         let p = &providers[sp.index];
-        let (price_str, token) = extract_price(p);
+        let price_val = extract_price(p);
         println!(
             "  {}. {}",
             style(i + 1).bold(),
@@ -417,9 +417,8 @@ async fn handle_request_inner(
             .map(|bps| format!(" (incl. {:.2}% protocol fee)", bps as f64 / 100.0))
             .unwrap_or_default();
         println!(
-            "     Price: {} {}{}",
-            format_price(price_str, &token),
-            token.to_uppercase(),
+            "     Price: {} SOL{}",
+            format_price(price_val),
             fee_note,
         );
         println!(
@@ -429,10 +428,9 @@ async fn handle_request_inner(
         );
 
         select_items.push(format!(
-            "{} — {} {} — score: {}",
+            "{} — {} SOL — score: {}",
             p.card.name,
-            format_price(price_str, &token),
-            token.to_uppercase(),
+            format_price(price_val),
             sp.score,
         ));
     }
@@ -464,7 +462,7 @@ async fn handle_request_inner(
         "submitting job request"
     );
 
-    let (price, _token) = extract_price(provider);
+    let price = extract_price(provider);
 
     // Relay tag value limit is typically 1024 bytes (strfry default).
     // Truncate to 950 bytes and strip \r to stay safely under the limit.
@@ -500,7 +498,8 @@ async fn handle_request_inner(
                 input.len(),
             );
             println!(
-                "      Relays may reject large events or unsupported kinds (5100).\n",
+                "      Relays may reject large events or unsupported kinds ({}).\n",
+                elisym_core::KIND_JOB_REQUEST_BASE + elisym_core::DEFAULT_KIND_OFFSET,
             );
             return RequestOutcome::Continue;
         }
@@ -514,7 +513,7 @@ async fn handle_request_inner(
 
     let mut results_rx = match agent
         .marketplace
-        .subscribe_to_results(&[100], &[provider.pubkey])
+        .subscribe_to_results(&[elisym_core::DEFAULT_KIND_OFFSET], &[provider.pubkey])
         .await
     {
         Ok(rx) => rx,
@@ -547,14 +546,12 @@ async fn handle_request_inner(
                                     req_data["fee_address"].as_str(),
                                 ) {
                                     let provider_net = total.saturating_sub(fee_amt);
-                                    let token = req_data["mint"].as_str().map_or("SOL", |_| "USDC");
                                     println!(
-                                        "  {} Payment: {} total → {} provider + {} protocol fee ({})",
+                                        "  {} Payment: {} total → {} provider + {} protocol fee (SOL)",
                                         style("$").yellow(),
                                         style(total).bold(),
                                         provider_net,
                                         fee_amt,
-                                        token,
                                     );
                                 } else {
                                     println!("  {} Payment required — paying...", style("$").yellow());
@@ -842,14 +839,13 @@ async fn score_providers(
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let (price, token) = extract_price(p);
+            let price = extract_price(p);
             json!({
                 "index": i,
                 "name": p.card.name,
                 "description": p.card.description,
                 "capabilities": p.card.capabilities,
                 "price": price,
-                "token": token,
             })
         })
         .collect();
@@ -900,8 +896,8 @@ Do not include any text outside the JSON array.";
     // Sort: score desc, then price asc
     scored.sort_by(|a, b| {
         b.score.cmp(&a.score).then_with(|| {
-            let (pa, _) = extract_price(&providers[a.index]);
-            let (pb, _) = extract_price(&providers[b.index]);
+            let pa = extract_price(&providers[a.index]);
+            let pb = extract_price(&providers[b.index]);
             pa.cmp(&pb)
         })
     });
@@ -909,14 +905,12 @@ Do not include any text outside the JSON array.";
     Ok(scored)
 }
 
-/// Extract price and token from a DiscoveredAgent's card metadata.
-fn extract_price(agent: &DiscoveredAgent) -> (u64, String) {
+/// Extract price from a DiscoveredAgent's card metadata.
+fn extract_price(agent: &DiscoveredAgent) -> u64 {
     if let Some(ref meta) = agent.card.metadata {
-        let price = meta["job_price"].as_u64().unwrap_or(0);
-        let token = meta["token"].as_str().unwrap_or("sol").to_string();
-        (price, token)
+        meta["job_price"].as_u64().unwrap_or(0)
     } else {
-        (0, "sol".to_string())
+        0
     }
 }
 
@@ -964,10 +958,7 @@ async fn balance_monitor(
     }
 }
 
-/// Format a price in human-readable form.
-fn format_price(base_amount: u64, token: &str) -> String {
-    match token {
-        "usdc" => format!("{:.6}", base_amount as f64 / 1_000_000.0),
-        _ => format!("{:.4}", base_amount as f64 / 1_000_000_000.0),
-    }
+/// Format a price in SOL.
+fn format_price(base_amount: u64) -> String {
+    format!("{:.4}", base_amount as f64 / 1_000_000_000.0)
 }
