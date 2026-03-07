@@ -1,7 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use serde::{Deserialize, Serialize};
+use solana_sdk::signature::Keypair;
 
 /// Heartbeat message for ping/pong liveness checks (NIP-17 encrypted).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,13 +33,7 @@ impl HeartbeatMessage {
     }
 }
 
-/// Generate a unique nonce from timestamp + atomic counter (no extra deps).
+/// Generate a cryptographically random nonce using OS entropy (via Solana's OsRng).
 pub fn random_nonce() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{:x}{:x}", ts, count)
+    bs58::encode(&Keypair::new().to_bytes()[..16]).into_string()
 }

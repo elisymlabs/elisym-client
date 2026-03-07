@@ -2,6 +2,7 @@ mod agent;
 mod args;
 mod banner;
 pub(crate) mod config;
+pub(crate) mod crypto;
 mod customer;
 mod dashboard;
 pub(crate) mod error;
@@ -22,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Parser;
 use console::style;
-use dialoguer::{Confirm, Input, MultiSelect, Select};
+use dialoguer::{Confirm, Input, MultiSelect, Password, Select};
 use nostr_sdk::{Keys, ToBech32};
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
@@ -193,7 +194,7 @@ pub async fn run() -> Result<()> {
         Some(Commands::Dashboard { chain, network, rpc_url }) => cmd_dashboard(&chain, &network, rpc_url).await?,
         None => {
             // No subcommand — show banner and help
-            print!("{}", banner::BANNER);
+            print!("{}", style(banner::BANNER).cyan());
             println!("  Run {} to get started.\n", style("elisym init").cyan());
             Cli::parse_from(["elisym", "--help"]);
         }
@@ -205,7 +206,7 @@ pub async fn run() -> Result<()> {
 // ── init ──────────────────────────────────────────────────────────────
 
 fn cmd_init() -> Result<()> {
-    print!("{}", banner::BANNER);
+    print!("{}", style(banner::BANNER).cyan());
     println!("  {}\n", style("Create a new agent").bold());
     println!("  {}", style("Your agent is an AI that lives on the elisym network.").dim());
     println!("  {}", style("It can earn SOL by completing tasks for other agents (provider),").dim());
@@ -223,6 +224,7 @@ fn cmd_init() -> Result<()> {
     let mut api_key = String::new();
     let mut model = String::new();
     let mut max_tokens: u32 = 4096;
+    let mut encryption_password: Option<String> = None;
 
     let mut step: usize = 0;
     loop {
@@ -416,6 +418,46 @@ fn cmd_init() -> Result<()> {
                 }
             }
 
+            // Step 8: Optional password encryption
+            8 => {
+                println!("  {}", style("Encrypt your agent's secret keys with a password.").dim());
+                println!("  {}", style("You'll enter this password each time you start the agent.").dim());
+                let options = &[
+                    "Yes, set a password",
+                    "No, store keys unencrypted",
+                    "\u{2190} Back",
+                ];
+                let default = if network == "mainnet" { 0 } else { 1 };
+                let idx = Select::new()
+                    .with_prompt("Encrypt keys?")
+                    .items(options)
+                    .default(default)
+                    .interact()?;
+
+                match idx {
+                    0 => {
+                        let pw = Password::new()
+                            .with_prompt("Password")
+                            .with_confirmation("Confirm password", "Passwords don't match")
+                            .interact()?;
+                        if pw.is_empty() {
+                            println!("  {} Password cannot be empty.", style("!").yellow());
+                            continue;
+                        }
+                        encryption_password = Some(pw);
+                        step += 1;
+                    }
+                    1 => {
+                        encryption_password = None;
+                        step += 1;
+                    }
+                    _ => {
+                        step -= 1;
+                        continue;
+                    }
+                }
+            }
+
             // Done — build config
             _ => break,
         }
@@ -437,7 +479,7 @@ fn cmd_init() -> Result<()> {
         max_tokens,
     };
 
-    let cfg = AgentConfig {
+    let mut cfg = AgentConfig {
         name: name.clone(),
         description,
         capabilities: vec!["general".to_string()],
@@ -459,24 +501,29 @@ fn cmd_init() -> Result<()> {
         capability_prompts: HashMap::new(),
         llm: Some(llm_section),
         customer_llm: None,
+        encryption: None,
     };
 
+    if let Some(ref password) = encryption_password {
+        cfg.encrypt_secrets(password)?;
+    }
     config::save_config(&cfg)?;
 
     let npub = keys.public_key().to_bech32().unwrap_or_default();
-    println!("\n  {} Agent '{}' created!", style("*").green(), style(&name).cyan());
-    println!("  npub:    {}", style(&npub).dim());
-    println!("  wallet:  {}", style(&solana_address).dim());
-    println!("  network: {}", style(&network).dim());
-    println!("  config:  {}", style(config::config_path(&name)?.display()).dim());
+    println!("\n  {} Agent {} created!", style("✓").green().bold(), style(&name).cyan().bold());
+    println!();
+    println!("     {}  {}", style("npub").dim(), style(&npub).dim());
+    println!("     {}  {}", style("wallet").dim(), style(&solana_address).dim());
+    println!("     {}  {}", style("network").dim(), style(&network).cyan());
+    println!("     {}  {}", style("config").dim(), style(config::config_path(&name)?.display()).dim());
 
     if network != "mainnet" {
         println!(
-            "\n  Run command to get devnet SOL: {}",
+            "\n  Get devnet SOL   {}",
             style(format!("elisym airdrop {}", name)).cyan()
         );
     }
-    println!("  Start agent:    {}\n", style(format!("elisym start {}", name)).cyan());
+    println!("  Start agent      {}\n", style(format!("elisym start {}", name)).cyan());
 
     Ok(())
 }
@@ -485,6 +532,15 @@ fn cmd_init() -> Result<()> {
 
 fn cmd_config(name: &str) -> Result<()> {
     let mut cfg = config::load_config(name)?;
+    let password = if cfg.is_encrypted() {
+        let p: String = Password::new()
+            .with_prompt("Password")
+            .interact()?;
+        cfg.decrypt_secrets(&p)?;
+        Some(p)
+    } else {
+        None
+    };
 
     println!("{}\n", style(format!("Configure agent: {}", name)).bold());
 
@@ -521,7 +577,7 @@ fn cmd_config(name: &str) -> Result<()> {
                                     for (n, p) in &caps {
                                         cfg.capability_prompts.insert(n.clone(), p.clone());
                                     }
-                                    config::save_config(&cfg)?;
+                                    save_config_encrypted(&mut cfg, &password)?;
                                     println!(
                                         "  {} Capabilities saved: {}",
                                         style("*").green(),
@@ -572,7 +628,7 @@ fn cmd_config(name: &str) -> Result<()> {
                                             selected
                                         };
                                         cfg.inactive_capabilities = inactive;
-                                        config::save_config(&cfg)?;
+                                        save_config_encrypted(&mut cfg, &password)?;
 
                                         println!(
                                             "  {} Active: {}",
@@ -604,7 +660,7 @@ fn cmd_config(name: &str) -> Result<()> {
                                                 );
                                             }
                                         }
-                                        config::save_config(&cfg)?;
+                                        save_config_encrypted(&mut cfg, &password)?;
                                         println!(
                                             "  {} Capabilities saved: {}",
                                             style("*").green(),
@@ -631,13 +687,13 @@ fn cmd_config(name: &str) -> Result<()> {
 
                                 match input.parse::<f64>() {
                                     Ok(sol) if sol >= 0.0 => {
-                                        let new_price = (sol * 1_000_000_000.0) as u64;
+                                        let new_price = sol_to_lamports(sol);
                                         if let Some(err) = agent::validate_job_price(new_price) {
                                             println!("  {} {}", style("!").yellow(), err);
                                             continue;
                                         }
                                         cfg.payment.job_price = new_price;
-                                        config::save_config(&cfg)?;
+                                        save_config_encrypted(&mut cfg, &password)?;
                                         println!(
                                             "  {} Price set to {} SOL",
                                             style("*").green(),
@@ -655,7 +711,7 @@ fn cmd_config(name: &str) -> Result<()> {
                         2 => {
                             if let Some(llm) = prompt_llm_section()? {
                                 cfg.llm = Some(llm);
-                                config::save_config(&cfg)?;
+                                save_config_encrypted(&mut cfg, &password)?;
                                 println!("  {} Provider LLM saved.", style("*").green());
                             }
                         }
@@ -678,7 +734,7 @@ fn cmd_config(name: &str) -> Result<()> {
                         0 => {
                             if let Some(llm) = prompt_llm_section()? {
                                 cfg.customer_llm = Some(llm);
-                                config::save_config(&cfg)?;
+                                save_config_encrypted(&mut cfg, &password)?;
                                 println!("  {} Customer LLM saved.", style("*").green());
                             }
                         }
@@ -873,8 +929,17 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
     };
 
     let mut cfg = config::load_config(&name)?;
+    let enc_password = if cfg.is_encrypted() {
+        let p: String = Password::new()
+            .with_prompt(format!("Password for '{}'", name))
+            .interact()?;
+        cfg.decrypt_secrets(&p)?;
+        Some(p)
+    } else {
+        None
+    };
 
-    print!("{}", banner::BANNER);
+    println!("{}", style(banner::BANNER).cyan());
     println!("  Starting agent {}...\n", style(&name).cyan().bold());
 
     if free {
@@ -901,11 +966,15 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
     drop(solana);
 
     // Mode selection
-    println!("  {}", style("Provider — your agent listens for jobs from the network, completes tasks").dim());
-    println!("  {}", style("           using your LLM, and earns SOL for each completed job.").dim());
     println!();
-    println!("  {}", style("Customer — you send requests to other agents on the network, they do the").dim());
-    println!("  {}", style("           work, and you pay them in SOL.").dim());
+    println!("  {} {}",
+        style("Provider").cyan().bold(),
+        style("— listen for jobs, complete tasks with your LLM, earn SOL").dim(),
+    );
+    println!("  {} {}",
+        style("Customer").cyan().bold(),
+        style("— send requests to other agents, pay them in SOL").dim(),
+    );
     println!();
     let mode_options = &["Provider (listen for jobs)", "Customer (send requests)"];
     let mode_idx = Select::new()
@@ -927,10 +996,11 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
                     for (name, prompt) in &caps {
                         cfg.capability_prompts.insert(name.clone(), prompt.clone());
                     }
-                    config::save_config(&cfg)?;
+                    save_config_encrypted(&mut cfg, &enc_password)?;
                     println!(
-                        "  {} Capabilities saved. Publishing to network...\n",
-                        style("*").green()
+                        "  {} Capabilities: {}\n",
+                        style("✓").green().bold(),
+                        style(cfg.capabilities.join(", ")).cyan(),
                     );
                 }
             }
@@ -947,19 +1017,19 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
 
                 match price_input.parse::<f64>() {
                     Ok(sol) if sol >= 0.0 => {
-                        let new_price = (sol * 1_000_000_000.0) as u64;
+                        let new_price = sol_to_lamports(sol);
                         if let Some(err) = agent::validate_job_price(new_price) {
                             println!("  {} {}", style("!").yellow(), err);
                             continue;
                         }
                         if new_price != cfg.payment.job_price {
                             cfg.payment.job_price = new_price;
-                            config::save_config(&cfg)?;
+                            save_config_encrypted(&mut cfg, &enc_password)?;
                         }
                         println!(
-                            "  {} Price: {} SOL\n",
-                            style("*").green(),
-                            style(format_sol(cfg.payment.job_price)).cyan()
+                            "  {} Price set to {} SOL\n",
+                            style("✓").green().bold(),
+                            style(format_sol(cfg.payment.job_price)).green().bold()
                         );
                         break;
                     }
@@ -976,8 +1046,19 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
             ).await?;
             info!(agent = %name, npub = %agent.identity.npub(), "agent node ready");
             println!();
-            println!("  {}", style("Other agents will be able to discover and send jobs to you.").dim());
-            println!("  {}", style("Press Ctrl+C to stop.").dim());
+            println!("  {} {}",
+                style("⚡").yellow(),
+                style("Agent is live — listening for jobs").bold(),
+            );
+            println!("     {}",
+                style(format!("Capabilities: {}", cfg.capabilities.join(", "))).dim(),
+            );
+            println!("     {}",
+                style(format!("Price: {} SOL per job", format_sol(cfg.payment.job_price))).dim(),
+            );
+            println!("     {}",
+                style("Press Ctrl+C to stop.").dim(),
+            );
             println!();
             agent::run_agent(agent, &cfg, free).await?;
         }
@@ -1113,9 +1194,12 @@ fn cmd_delete(name: &str) -> Result<()> {
 // ── wallet ────────────────────────────────────────────────────────────
 
 fn cmd_wallet(name: &str) -> Result<()> {
-    let cfg = config::load_config(name)?;
+    let mut cfg = config::load_config(name)?;
+    if cfg.is_encrypted() {
+        unlock_config(&mut cfg)?;
+    }
 
-    print!("{}", banner::BANNER);
+    print!("{}", style(banner::BANNER).cyan());
     println!(
         "  Wallet for agent {}\n",
         style(name).cyan().bold()
@@ -1130,7 +1214,10 @@ fn cmd_wallet(name: &str) -> Result<()> {
 // ── airdrop ──────────────────────────────────────────────────────────
 
 fn cmd_airdrop(name: &str, amount: f64) -> Result<()> {
-    let cfg = config::load_config(name)?;
+    let mut cfg = config::load_config(name)?;
+    if cfg.is_encrypted() {
+        unlock_config(&mut cfg)?;
+    }
 
     if cfg.payment.network == "mainnet" {
         return Err(CliError::Other("airdrop is only available on devnet/testnet".into()));
@@ -1138,7 +1225,7 @@ fn cmd_airdrop(name: &str, amount: f64) -> Result<()> {
 
     let solana = agent::build_solana_provider(&cfg)?;
 
-    let lamports = (amount * 1_000_000_000.0) as u64;
+    let lamports = sol_to_lamports(amount);
     println!(
         "  Requesting airdrop of {} SOL ({} lamports) on {}...",
         amount, lamports, cfg.payment.network
@@ -1164,12 +1251,15 @@ fn cmd_airdrop(name: &str, amount: f64) -> Result<()> {
 // ── send ─────────────────────────────────────────────────────────────
 
 fn cmd_send(name: &str, address: &str, amount: f64) -> Result<()> {
-    let cfg = config::load_config(name)?;
+    let mut cfg = config::load_config(name)?;
+    if cfg.is_encrypted() {
+        unlock_config(&mut cfg)?;
+    }
 
     let solana = agent::build_solana_provider(&cfg)?;
 
     // Convert SOL to lamports
-    let base_amount = (amount * 1_000_000_000.0) as u64;
+    let base_amount = sol_to_lamports(amount);
     let unit_label = "SOL";
 
     // Show current balance
@@ -1234,13 +1324,13 @@ fn display_wallet_status(solana: &elisym_core::SolanaPaymentProvider, cfg: &Agen
     let address = solana.address();
     let balance = solana.balance().unwrap_or(0);
 
-    println!("\n  {}", style("Solana Wallet").bold().underlined());
-    println!("  Network:  {}", style(&cfg.payment.network).dim());
-    println!("  Address:  {}", style(&address).dim());
+    println!("\n  {} {}", style("◆").cyan(), style("Wallet").bold());
+    println!("     Network  {}", style(&cfg.payment.network).cyan());
+    println!("     Address  {}", style(&address).dim());
     println!(
-        "  Balance:  {} SOL ({} lamports)",
-        style(format_sol(balance)).green(),
-        balance
+        "     Balance  {} SOL {}",
+        style(format_sol(balance)).green().bold(),
+        style(format!("({} lamports)", balance)).dim(),
     );
 
     Ok(())
@@ -1254,4 +1344,58 @@ async fn cmd_dashboard(chain: &str, network: &str, rpc_url: Option<String>) -> R
 
 fn format_sol(lamports: u64) -> String {
     format!("{:.9}", lamports as f64 / 1_000_000_000.0)
+}
+
+/// Convert a SOL f64 amount to lamports with rounding (avoids truncation errors).
+fn sol_to_lamports(sol: f64) -> u64 {
+    (sol * 1_000_000_000.0).round() as u64
+}
+
+/// Extract job price from a DiscoveredAgent's card metadata.
+pub(crate) fn extract_job_price(agent: &elisym_core::DiscoveredAgent) -> u64 {
+    agent
+        .card
+        .metadata
+        .as_ref()
+        .and_then(|m| m["job_price"].as_u64())
+        .unwrap_or(0)
+}
+
+/// Prompt for password and decrypt secrets if the config is encrypted.
+fn unlock_config(cfg: &mut config::AgentConfig) -> Result<()> {
+    if !cfg.is_encrypted() {
+        return Ok(());
+    }
+    let max_attempts = 3;
+    for attempt in 1..=max_attempts {
+        let password: String = Password::new()
+            .with_prompt("Password")
+            .interact()?;
+        match cfg.decrypt_secrets(&password) {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < max_attempts => {
+                println!(
+                    "  {} Wrong password ({}/{})",
+                    style("!").yellow(),
+                    attempt,
+                    max_attempts,
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
+/// Save config, re-encrypting secrets if a password is provided.
+/// Encrypts → saves → decrypts back so the in-memory config stays usable.
+fn save_config_encrypted(cfg: &mut config::AgentConfig, password: &Option<String>) -> Result<()> {
+    if let Some(ref p) = password {
+        cfg.encrypt_secrets(p)?;
+        config::save_config(cfg)?;
+        cfg.decrypt_secrets(p)?;
+    } else {
+        config::save_config(cfg)?;
+    }
+    Ok(())
 }

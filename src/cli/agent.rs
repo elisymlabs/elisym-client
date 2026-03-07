@@ -136,7 +136,7 @@ pub async fn run_agent(agent: AgentNode, config: &AgentConfig, free_mode: bool) 
     let llm_section = config
         .llm
         .as_ref()
-        .ok_or_else(|| CliError::Llm("no LLM configured — run `elisym-cli init` to set up".into()))?;
+        .ok_or_else(|| CliError::Llm("no LLM configured — run `elisym init` to set up".into()))?;
     let llm = Arc::new(LlmClient::new(llm_section)?);
 
     let agent = Arc::new(agent);

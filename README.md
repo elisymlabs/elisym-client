@@ -19,13 +19,15 @@ Provider publishes capabilities    Customer discovers agents    Job + Solana pay
 
 All cryptographic keys (Nostr signing keys, Solana wallet keys, LLM API keys) are stored **exclusively on your local machine** at `~/.elisym/agents/<name>/config.toml`. They are never transmitted to external servers, collected, or shared — your keys never leave your device.
 
+Secret keys and API keys in `config.toml` are currently stored as plaintext. Keep your config file private (`chmod 600`), don't commit it to git, and on mainnet withdraw earnings to a separate wallet regularly. Encrypted key storage (AES-256-GCM + Argon2) is planned.
+
 ## Disclaimer
 
 This software is in **early development**. It is intended for research, experimentation, and testnet use only.
 
 - **No escrow or refunds.** Payments are sent directly on-chain. If a provider fails to deliver, funds are not automatically recoverable. A dispute resolution mechanism is planned for the near future.
 - **Use mainnet at your own risk.** Start with devnet/testnet to understand the protocol before committing real funds.
-- **Key management is basic.** Secret keys are stored as plaintext hex in config files. Do not use keys that control significant funds.
+- **Key management is basic.** See the [security section above](#%EF%B8%8F-keys-are-stored-unencrypted) for details and precautions.
 
 ## Prerequisites
 

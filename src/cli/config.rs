@@ -6,6 +6,26 @@ use serde::{Deserialize, Serialize};
 
 use super::error::{CliError, Result};
 
+/// Validate that an agent name is safe for use as a directory name.
+/// Allows ASCII alphanumeric characters, hyphens, and underscores only.
+pub fn validate_agent_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(CliError::Other("agent name cannot be empty".into()));
+    }
+    if name == "." || name == ".." {
+        return Err(CliError::Other("invalid agent name".into()));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(CliError::Other(
+            "agent name may only contain letters, digits, hyphens, and underscores".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub name: String,
@@ -22,6 +42,59 @@ pub struct AgentConfig {
     pub llm: Option<LlmSection>,
     #[serde(default)]
     pub customer_llm: Option<LlmSection>,
+    #[serde(default)]
+    pub encryption: Option<super::crypto::EncryptionSection>,
+}
+
+impl AgentConfig {
+    /// Returns true if secrets are encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.encryption.is_some()
+    }
+
+    /// Bundle all secret fields for encryption.
+    pub fn secrets_bundle(&self) -> super::crypto::SecretsBundle {
+        super::crypto::SecretsBundle {
+            nostr_secret_key: self.secret_key.clone(),
+            solana_secret_key: self.payment.solana_secret_key.clone(),
+            llm_api_key: self.llm.as_ref().map(|l| l.api_key.clone()).unwrap_or_default(),
+            customer_llm_api_key: self.customer_llm.as_ref().map(|l| l.api_key.clone()),
+        }
+    }
+
+    /// Encrypt secrets with password and clear plaintext fields in-place.
+    pub fn encrypt_secrets(&mut self, password: &str) -> Result<()> {
+        let bundle = self.secrets_bundle();
+        let section = super::crypto::encrypt_secrets(&bundle, password)?;
+        self.encryption = Some(section);
+        self.secret_key = String::new();
+        self.payment.solana_secret_key = String::new();
+        if let Some(ref mut llm) = self.llm {
+            llm.api_key = String::new();
+        }
+        if let Some(ref mut cllm) = self.customer_llm {
+            cllm.api_key = String::new();
+        }
+        Ok(())
+    }
+
+    /// Decrypt secrets with password and populate plaintext fields in-place.
+    pub fn decrypt_secrets(&mut self, password: &str) -> Result<()> {
+        let section = self.encryption.as_ref()
+            .ok_or_else(|| CliError::Other("config is not encrypted".into()))?;
+        let bundle = super::crypto::decrypt_secrets(section, password)?;
+        self.secret_key = bundle.nostr_secret_key;
+        self.payment.solana_secret_key = bundle.solana_secret_key;
+        if let Some(ref mut llm) = self.llm {
+            llm.api_key = bundle.llm_api_key;
+        }
+        if let Some(ref mut cllm) = self.customer_llm {
+            if let Some(key) = bundle.customer_llm_api_key {
+                cllm.api_key = key;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,6 +152,7 @@ fn agents_root() -> Result<PathBuf> {
 
 /// Directory for a specific agent: ~/.elisym/agents/<name>/
 pub fn agent_dir(name: &str) -> Result<PathBuf> {
+    validate_agent_name(name)?;
     Ok(agents_root()?.join(name))
 }
 

@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use console::style;
@@ -37,98 +37,254 @@ enum InputResult {
     Interrupted,
 }
 
-/// Read multi-line input using crossterm raw mode.
-/// Enter → submit, Ctrl+J → newline (works in all terminals).
-/// Pasted text is captured as a single block (bracketed paste).
-/// Fallback: if bracketed paste is unsupported, Enter during a fast stream
-/// of characters (paste) is treated as a newline, not submit.
-fn read_multiline_input() -> io::Result<InputResult> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    crossterm::execute!(stdout, EnableBracketedPaste)?;
+// ── Event-driven input ───────────────────────────────────────────────
 
-    let result = (|| -> io::Result<InputResult> {
-        let mut buffer = String::new();
-
+/// Spawn a blocking thread that reads crossterm events and sends them
+/// through a channel. Stops when the receiver is dropped.
+fn spawn_term_reader(tx: mpsc::Sender<io::Result<Event>>) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
         loop {
-            match event::read()? {
-                Event::Key(KeyEvent {
-                    code, modifiers, kind: KeyEventKind::Press, ..
-                }) => match code {
-                    // Ctrl+J → insert newline (universally works in raw mode)
-                    KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        buffer.push('\n');
-                        crossterm::execute!(stdout, Print("\r\n"))?;
-                    }
-                    KeyCode::Enter => {
-                        // Shift+Enter / Alt+Enter → newline (works in some terminals)
-                        if modifiers.contains(KeyModifiers::SHIFT)
-                            || modifiers.contains(KeyModifiers::ALT)
-                        {
-                            buffer.push('\n');
-                            crossterm::execute!(stdout, Print("\r\n"))?;
-                        } else {
-                            // Check if more keys arrive quickly (paste without
-                            // bracketed paste support). If another key comes within
-                            // 50ms, this Enter is part of a paste → treat as newline.
-                            if event::poll(std::time::Duration::from_millis(50))? {
-                                buffer.push('\n');
-                                crossterm::execute!(stdout, Print("\r\n"))?;
-                            } else {
-                                // No more input → real submit
-                                crossterm::execute!(stdout, Print("\r\n"))?;
-                                return Ok(InputResult::Text(buffer));
-                            }
+            match event::poll(Duration::from_millis(100)) {
+                Ok(true) => match event::read() {
+                    Ok(ev) => {
+                        if tx.blocking_send(Ok(ev)).is_err() {
+                            break;
                         }
                     }
-                    KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        crossterm::execute!(stdout, Print("\r\n"))?;
-                        return Ok(InputResult::Interrupted);
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(e));
+                        break;
                     }
-                    KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        if buffer.is_empty() {
-                            return Ok(InputResult::Eof);
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        buffer.push(c);
-                        crossterm::execute!(stdout, Print(c.to_string()))?;
-                    }
-                    KeyCode::Backspace => {
-                        if let Some(c) = buffer.pop() {
-                            if c == '\n' {
-                                crossterm::execute!(
-                                    stdout,
-                                    crossterm::cursor::MoveUp(1),
-                                    crossterm::cursor::MoveToColumn(
-                                        buffer.lines().last().map_or(0, |l| l.len() as u16)
-                                            + 3 // ">> " prompt width
-                                    ),
-                                )?;
-                            } else {
-                                crossterm::execute!(stdout, Print("\x08 \x08"))?;
-                            }
-                        }
-                    }
-                    _ => {}
                 },
-                Event::Paste(text) => {
-                    // Normalize line endings: \r\n → \n, lone \r → \n
-                    let clean = text.replace("\r\n", "\n").replace('\r', "\n");
-                    buffer.push_str(&clean);
-                    let display = clean.replace('\n', "\r\n");
-                    crossterm::execute!(stdout, Print(&display))?;
+                Ok(false) => {
+                    if tx.is_closed() {
+                        break;
+                    }
                 }
-                _ => {}
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    break;
+                }
             }
         }
-    })();
+    })
+}
 
-    // Always restore terminal state
-    let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
-    let _ = disable_raw_mode();
+/// Get terminal width, defaulting to 80 if unavailable.
+fn term_width() -> u16 {
+    crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80)
+}
 
-    result
+/// State for the current input line(s), including an optional balance status line.
+/// All terminal output during input collection goes through this struct, ensuring
+/// no concurrent writes to stdout.
+struct InputState {
+    buffer: String,
+    balance_line: Option<String>,
+}
+
+impl InputState {
+    fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            balance_line: None,
+        }
+    }
+
+    /// Number of screen rows occupied: top border + balance (if any) + prompt + buffer lines + bottom border.
+    fn display_rows(&self) -> u16 {
+        let mut rows: u16 = 2; // top border + prompt line
+        rows += self.buffer.matches('\n').count() as u16;
+        if self.balance_line.is_some() {
+            rows += 1;
+        }
+        rows += 1; // bottom border
+        rows
+    }
+
+    /// Full redraw of the input area: move to top, clear, reprint everything.
+    fn redraw(&self, stdout: &mut io::Stdout) -> io::Result<()> {
+        let rows = self.display_rows();
+        if rows > 1 {
+            crossterm::execute!(stdout, crossterm::cursor::MoveUp(rows - 1))?;
+        }
+        crossterm::execute!(
+            stdout,
+            crossterm::cursor::MoveToColumn(0),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown),
+        )?;
+
+        let w = term_width() as usize;
+        // Top border
+        write!(stdout, "{}\r\n", style("─".repeat(w)).dim())?;
+        if let Some(ref bal) = self.balance_line {
+            write!(stdout, "{}\r\n", bal)?;
+        }
+        // Prompt + buffer
+        write!(stdout, "{} ", style("❯").cyan().bold())?;
+        if !self.buffer.is_empty() {
+            write!(stdout, "{}", self.buffer.replace('\n', "\r\n"))?;
+        }
+        // Save cursor, print bottom border, restore cursor
+        crossterm::execute!(stdout, crossterm::cursor::SavePosition)?;
+        write!(stdout, "\r\n{}", style("─".repeat(w)).dim())?;
+        crossterm::execute!(stdout, crossterm::cursor::RestorePosition)?;
+        stdout.flush()?;
+        Ok(())
+    }
+
+    /// Update the balance status line and trigger a full redraw.
+    fn update_balance(
+        &mut self,
+        stdout: &mut io::Stdout,
+        balance: u64,
+        prev: u64,
+    ) -> io::Result<()> {
+        let sol = balance as f64 / 1_000_000_000.0;
+        let diff = balance as i64 - prev as i64;
+        let diff_sol = diff as f64 / 1_000_000_000.0;
+        let sign = if diff > 0 { "+" } else { "" };
+        self.balance_line = Some(format!(
+            "  {} Balance: {} SOL ({}{})",
+            style("$").yellow(),
+            style(format!("{:.4}", sol)).green(),
+            sign,
+            style(format!("{:.4}", diff_sol)).dim(),
+        ));
+        self.redraw(stdout)
+    }
+}
+
+/// Collect multi-line input asynchronously, handling terminal events and balance
+/// updates through channels. All stdout writes happen in this single async task,
+/// eliminating the race condition between input echo and balance display.
+///
+/// Enter → submit, Ctrl+J → newline, Shift/Alt+Enter → newline.
+/// Bracketed paste is enabled. Fallback paste detection via 50ms timeout.
+async fn collect_input(
+    term_rx: &mut mpsc::Receiver<io::Result<Event>>,
+    bal_rx: &mut mpsc::Receiver<(u64, u64)>,
+) -> io::Result<InputResult> {
+    let mut state = InputState::new();
+    let mut stdout = io::stdout();
+    let mut pending: VecDeque<Event> = VecDeque::new();
+
+    // Draw initial bottom border
+    {
+        let w = term_width() as usize;
+        crossterm::execute!(stdout, crossterm::cursor::SavePosition)?;
+        write!(stdout, "\r\n{}", style("─".repeat(w)).dim())?;
+        crossterm::execute!(stdout, crossterm::cursor::RestorePosition)?;
+        stdout.flush()?;
+    }
+
+    loop {
+        let ev = if let Some(ev) = pending.pop_front() {
+            ev
+        } else {
+            tokio::select! {
+                biased;
+                Some((balance, prev)) = bal_rx.recv() => {
+                    state.update_balance(&mut stdout, balance, prev)?;
+                    continue;
+                }
+                Some(result) = term_rx.recv() => result?,
+                else => return Ok(InputResult::Eof),
+            }
+        };
+
+        match ev {
+            Event::Key(KeyEvent {
+                code, modifiers, kind: KeyEventKind::Press, ..
+            }) => match code {
+                // Ctrl+J → insert newline (universally works in raw mode)
+                KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.buffer.push('\n');
+                    crossterm::execute!(stdout, Print("\r\n"))?;
+                }
+                // Shift+Enter / Alt+Enter → newline (works in some terminals)
+                KeyCode::Enter
+                    if modifiers.contains(KeyModifiers::SHIFT)
+                        || modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    state.buffer.push('\n');
+                    crossterm::execute!(stdout, Print("\r\n"))?;
+                }
+                // Enter → submit (with paste detection)
+                KeyCode::Enter => {
+                    // Check if more keys arrive quickly (paste without bracketed paste
+                    // support). If another key comes within 50ms, this Enter is part of
+                    // a paste → treat as newline.
+                    match tokio::time::timeout(Duration::from_millis(50), term_rx.recv()).await {
+                        Ok(Some(Ok(next_ev))) => {
+                            // More input arrived → Enter was part of a paste
+                            state.buffer.push('\n');
+                            crossterm::execute!(stdout, Print("\r\n"))?;
+                            pending.push_back(next_ev);
+                        }
+                        Ok(Some(Err(e))) => return Err(e),
+                        _ => {
+                            // Timeout or channel closed → real submit
+                            // Move past bottom border, then clear it
+                            crossterm::execute!(
+                                stdout,
+                                Print("\r\n"),
+                                crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+                            )?;
+                            return Ok(InputResult::Text(state.buffer));
+                        }
+                    }
+                }
+                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    crossterm::execute!(
+                        stdout,
+                        Print("\r\n"),
+                        crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+                    )?;
+                    return Ok(InputResult::Interrupted);
+                }
+                KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    if state.buffer.is_empty() {
+                        crossterm::execute!(
+                            stdout,
+                            Print("\r\n"),
+                            crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+                        )?;
+                        return Ok(InputResult::Eof);
+                    }
+                }
+                KeyCode::Char(c) => {
+                    state.buffer.push(c);
+                    crossterm::execute!(stdout, Print(c.to_string()))?;
+                }
+                KeyCode::Backspace => {
+                    if let Some(c) = state.buffer.pop() {
+                        if c == '\n' {
+                            crossterm::execute!(
+                                stdout,
+                                crossterm::cursor::MoveUp(1),
+                                crossterm::cursor::MoveToColumn(
+                                    state.buffer.lines().last().map_or(0, |l| l.len() as u16)
+                                        + 3 // ">> " prompt width
+                                ),
+                            )?;
+                        } else {
+                            crossterm::execute!(stdout, Print("\x08 \x08"))?;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Event::Paste(text) => {
+                // Normalize line endings: \r\n → \n, lone \r → \n
+                let clean = text.replace("\r\n", "\n").replace('\r', "\n");
+                state.buffer.push_str(&clean);
+                let display = clean.replace('\n', "\r\n");
+                crossterm::execute!(stdout, Print(&display))?;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Run the interactive customer REPL.
@@ -138,12 +294,13 @@ pub async fn run_customer_repl(mut agent: AgentNode, config: &AgentConfig) -> Re
         .customer_llm
         .as_ref()
         .or(config.llm.as_ref())
-        .ok_or_else(|| CliError::Llm("no LLM configured — run `elisym-cli init` to set up".into()))?;
+        .ok_or_else(|| CliError::Llm("no LLM configured — run `elisym init` to set up".into()))?;
     let llm = LlmClient::new(llm_section)?;
 
     println!(
-        "\n  {} Customer mode — type a request, or {} to quit\n",
-        style("*").green(),
+        "\n  {} {} — type a request, or {} to quit\n",
+        style("⚡").yellow(),
+        style("Customer mode").bold(),
         style("exit").dim(),
     );
 
@@ -158,11 +315,11 @@ pub async fn run_customer_repl(mut agent: AgentNode, config: &AgentConfig) -> Re
         }
     }
 
-    // Start background balance monitor
+    // Balance monitor sends updates through a channel instead of writing to stdout
+    let (bal_tx, mut bal_rx) = mpsc::channel::<(u64, u64)>(8);
     let balance_stop = Arc::new(AtomicBool::new(false));
     let balance_handle = if let Some(solana) = agent.solana_payments() {
         let initial = solana.balance().unwrap_or(0);
-        let last_balance = Arc::new(AtomicU64::new(initial));
         let stop = Arc::clone(&balance_stop);
         let rpc_url = config.payment.rpc_url.clone().unwrap_or_else(|| {
             match config.payment.network.as_str() {
@@ -172,7 +329,7 @@ pub async fn run_customer_repl(mut agent: AgentNode, config: &AgentConfig) -> Re
             }.to_string()
         });
         let address = solana.address();
-        Some(tokio::spawn(balance_monitor(rpc_url, address, last_balance, stop)))
+        Some(tokio::spawn(balance_monitor(rpc_url, address, initial, bal_tx, stop)))
     } else {
         None
     };
@@ -181,26 +338,46 @@ pub async fn run_customer_repl(mut agent: AgentNode, config: &AgentConfig) -> Re
     let mut feedback_rx = agent.marketplace.subscribe_to_feedback().await?;
 
     println!(
-        "  {} Ctrl+J for new line, Enter to send, paste supported",
+        "  {} {}\n",
         style("~").dim(),
+        style("Ctrl+J for new line · Enter to send · paste supported").dim(),
     );
-    println!("  {}\n", style("Describe what you need — your agent will find the best provider and handle payment.").dim());
 
     loop {
-        // Prompt
-        print!("{} ", style(">>").cyan().bold());
-        io::stdout().flush()?;
+        // Print input box with borders
+        {
+            let w = term_width() as usize;
+            println!("{}", style("─".repeat(w)).dim());
+            print!("{} ", style("❯").cyan().bold());
+            io::stdout().flush()?;
+            // Bottom border is drawn by InputState::redraw once raw mode starts
+        }
 
-        // Read input with crossterm raw mode (supports multi-line + paste)
-        let input = match tokio::task::spawn_blocking(read_multiline_input).await {
-            Ok(Ok(InputResult::Text(s))) => s.trim().to_string(),
-            Ok(Ok(InputResult::Interrupted)) => {
+        // Enter raw mode and start terminal event reader for this input
+        enable_raw_mode()?;
+        crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
+        let (term_tx, mut term_rx) = mpsc::channel(64);
+        let term_handle = spawn_term_reader(term_tx);
+
+        // Collect input — handles both keystrokes and balance updates safely
+        let input_result = collect_input(&mut term_rx, &mut bal_rx).await;
+
+        // Stop term reader (dropping receiver causes sender to see closed channel)
+        drop(term_rx);
+        let _ = term_handle.await;
+
+        // Restore terminal state
+        let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
+        let _ = disable_raw_mode();
+
+        let input = match input_result {
+            Ok(InputResult::Text(s)) => s.trim().to_string(),
+            Ok(InputResult::Interrupted) => {
                 println!("  Goodbye!");
                 break;
             }
-            Ok(Ok(InputResult::Eof)) => break,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(e) => return Err(CliError::Other(format!("input task: {}", e))),
+            Ok(InputResult::Eof) => break,
+            Err(e) => return Err(e.into()),
         };
 
         if input.is_empty() {
@@ -210,6 +387,9 @@ pub async fn run_customer_repl(mut agent: AgentNode, config: &AgentConfig) -> Re
             println!("  Goodbye!");
             break;
         }
+
+        // Drain any pending balance updates before processing request
+        while bal_rx.try_recv().is_ok() {}
 
         // Run all steps in a cancellable block — Ctrl+C at any point breaks out
         let step_result = handle_request(&agent, &llm, &input, &mut feedback_rx, &config.payment.chain, &config.payment.network).await;
@@ -404,7 +584,7 @@ async fn handle_request_inner(
     let mut select_items: Vec<String> = Vec::new();
     for (i, sp) in online_scored.iter().enumerate() {
         let p = &providers[sp.index];
-        let price_val = extract_price(p);
+        let price_val = super::extract_job_price(p);
         println!(
             "  {}. {}",
             style(i + 1).bold(),
@@ -462,7 +642,7 @@ async fn handle_request_inner(
         "submitting job request"
     );
 
-    let price = extract_price(provider);
+    let price = super::extract_job_price(provider);
 
     // Relay tag value limit is typically 1024 bytes (strfry default).
     // Truncate to 950 bytes and strip \r to stay safely under the limit.
@@ -839,7 +1019,7 @@ async fn score_providers(
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let price = extract_price(p);
+            let price = super::extract_job_price(p);
             json!({
                 "index": i,
                 "name": p.card.name,
@@ -896,8 +1076,8 @@ Do not include any text outside the JSON array.";
     // Sort: score desc, then price asc
     scored.sort_by(|a, b| {
         b.score.cmp(&a.score).then_with(|| {
-            let pa = extract_price(&providers[a.index]);
-            let pb = extract_price(&providers[b.index]);
+            let pa = super::extract_job_price(&providers[a.index]);
+            let pb = super::extract_job_price(&providers[b.index]);
             pa.cmp(&pb)
         })
     });
@@ -905,54 +1085,40 @@ Do not include any text outside the JSON array.";
     Ok(scored)
 }
 
-/// Extract price from a DiscoveredAgent's card metadata.
-fn extract_price(agent: &DiscoveredAgent) -> u64 {
-    if let Some(ref meta) = agent.card.metadata {
-        meta["job_price"].as_u64().unwrap_or(0)
-    } else {
-        0
-    }
-}
-
-/// Background task that polls SOL balance and prints updates when it changes.
+/// Background task that polls SOL balance and sends updates through a channel.
+/// Never writes to stdout directly — the REPL loop handles display.
 async fn balance_monitor(
     rpc_url: String,
     address: String,
-    last_balance: Arc<AtomicU64>,
+    initial_balance: u64,
+    tx: mpsc::Sender<(u64, u64)>,
     stop: Arc<AtomicBool>,
 ) {
     use solana_sdk::pubkey::Pubkey;
     use std::str::FromStr;
 
-    let rpc = solana_client::rpc_client::RpcClient::new(&rpc_url);
+    let rpc = Arc::new(solana_client::rpc_client::RpcClient::new(&rpc_url));
     let pubkey = match Pubkey::from_str(&address) {
         Ok(pk) => pk,
         Err(_) => return,
     };
 
+    let mut last_balance = initial_balance;
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         interval.tick().await;
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        if let Ok(balance) = rpc.get_balance(&pubkey) {
-            let prev = last_balance.swap(balance, Ordering::Relaxed);
-            if balance != prev {
-                let sol = balance as f64 / 1_000_000_000.0;
-                let diff = balance as i64 - prev as i64;
-                let diff_sol = diff as f64 / 1_000_000_000.0;
-                let sign = if diff > 0 { "+" } else { "" };
-                // Clear current line (may have prompt), print balance, reprint prompt
-                print!(
-                    "\r\x1b[2K  {} Balance: {} SOL ({}{})\r\n{} ",
-                    style("$").yellow(),
-                    style(format!("{:.4}", sol)).green(),
-                    sign,
-                    style(format!("{:.4}", diff_sol)).dim(),
-                    style(">>").cyan().bold(),
-                );
-                let _ = io::stdout().flush();
+        let rpc = Arc::clone(&rpc);
+        let balance_result = tokio::task::spawn_blocking(move || rpc.get_balance(&pubkey)).await;
+        if let Ok(Ok(balance)) = balance_result {
+            if balance != last_balance {
+                let prev = last_balance;
+                last_balance = balance;
+                if tx.send((balance, prev)).await.is_err() {
+                    break;
+                }
             }
         }
     }

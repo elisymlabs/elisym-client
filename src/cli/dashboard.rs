@@ -707,7 +707,7 @@ fn spawn_discovery(
                             continue;
                         }
 
-                        let price = extract_price(&a);
+                        let price = super::extract_job_price(&a);
                         let npub_str = a.pubkey.to_bech32().unwrap_or_default();
                         let entry = AgentEntry {
                             name: a.card.name.clone(),
@@ -914,14 +914,16 @@ pub async fn run_dashboard(chain: String, network: String, rpc_url: Option<Strin
         }
     }
 
-    // Cleanup: restore terminal, then exit immediately
+    // Cleanup: restore terminal, drop receiver to signal tasks to stop
     drop(terminal);
     drop(_guard);
+    drop(rx);
+
+    // Brief grace period for spawned tasks to notice closed channel and exit
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     info!("dashboard closed");
-
-    // Force exit — background tasks (discovery, balance poller) would hang otherwise
-    std::process::exit(0);
+    Ok(())
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -954,13 +956,6 @@ fn extract_network(agent: &elisym_core::DiscoveredAgent) -> String {
         .to_string()
 }
 
-fn extract_price(agent: &elisym_core::DiscoveredAgent) -> u64 {
-    if let Some(ref meta) = agent.card.metadata {
-        meta["job_price"].as_u64().unwrap_or(0)
-    } else {
-        0
-    }
-}
 
 /// Format a unix timestamp as local time HH:MM:SS
 fn format_local_time(unix_ts: u64) -> String {
