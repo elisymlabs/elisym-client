@@ -281,8 +281,8 @@ fn cmd_init() -> Result<String> {
                 println!("  {}", style("Solana is used for payments between agents.").dim());
                 println!("  {}", style("Use devnet for testing (free SOL via faucet.solana.com).").dim());
                 let options = &[
-                    "mainnet (default)",
-                    "devnet (testing)",
+                    "devnet (default, testing)",
+                    "mainnet",
                     "testnet (coming soon)",
                     "\u{2190} Back",
                 ];
@@ -303,8 +303,8 @@ fn cmd_init() -> Result<String> {
                 }
 
                 network = match idx {
-                    1 => "devnet",
-                    _ => "mainnet",
+                    1 => "mainnet",
+                    _ => "devnet",
                 }.to_string();
                 step += 1;
             }
