@@ -195,7 +195,6 @@ pub async fn run() -> Result<()> {
         Some(Commands::Delete { name }) => cmd_delete(&name)?,
         Some(Commands::Config { name }) => cmd_config(&name)?,
         Some(Commands::Wallet { name }) => cmd_wallet(&name)?,
-        Some(Commands::Airdrop { name, amount }) => cmd_airdrop(&name, &amount)?,
         Some(Commands::Send { name, address, amount }) => cmd_send(&name, &address, &amount)?,
         Some(Commands::Dashboard { chain, network, rpc_url }) => cmd_dashboard(&chain, &network, rpc_url).await?,
         None => {
@@ -280,7 +279,7 @@ fn cmd_init() -> Result<String> {
             // Step 2: Solana network
             2 => {
                 println!("  {}", style("Solana is used for payments between agents.").dim());
-                println!("  {}", style("Use devnet for testing (free SOL via airdrop).").dim());
+                println!("  {}", style("Use devnet for testing (free SOL via faucet.solana.com).").dim());
                 let options = &[
                     "mainnet (default)",
                     "devnet (testing)",
@@ -531,7 +530,7 @@ fn cmd_init() -> Result<String> {
     if network != "mainnet" {
         println!(
             "\n  Get devnet SOL   {}",
-            style(format!("elisym airdrop {}", name)).cyan()
+            style("https://faucet.solana.com").cyan()
         );
     }
     println!("  Start agent      {}\n", style(format!("elisym start {}", name)).cyan());
@@ -977,7 +976,7 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
             println!(
                 "\n  {} Wallet is empty. Get devnet SOL: {}",
                 style("!").yellow(),
-                style(format!("elisym airdrop {}", name)).cyan()
+                style("https://faucet.solana.com").cyan()
             );
         }
     }
@@ -1222,44 +1221,6 @@ fn cmd_wallet(name: &str) -> Result<()> {
 
     let solana = agent::build_solana_provider(&cfg)?;
     display_wallet_status(&solana, &cfg)?;
-
-    Ok(())
-}
-
-// ── airdrop ──────────────────────────────────────────────────────────
-
-fn cmd_airdrop(name: &str, amount: &str) -> Result<()> {
-    let mut cfg = config::load_config(name)?;
-    if cfg.is_encrypted() {
-        unlock_config(&mut cfg)?;
-    }
-
-    if cfg.payment.network == "mainnet" {
-        return Err(CliError::Other("airdrop is only available on devnet/testnet".into()));
-    }
-
-    let solana = agent::build_solana_provider(&cfg)?;
-
-    let lamports = sol_to_lamports(amount)
-        .ok_or_else(|| CliError::Other(format!("invalid SOL amount: {}", amount)))?;
-    println!(
-        "  Requesting airdrop of {} SOL ({} lamports) on {}...",
-        format_sol_compact(lamports), lamports, cfg.payment.network
-    );
-
-    let sig = solana.request_airdrop(lamports)?;
-    println!("  {} Airdrop requested!", style("*").green());
-    println!("  Signature: {}", style(&sig).dim());
-
-    // Brief pause then show balance
-    std::thread::sleep(std::time::Duration::from_secs(2));
-
-    let balance = solana.balance().unwrap_or(0);
-    println!(
-        "  Balance:   {} SOL ({} lamports)",
-        format_sol(balance),
-        balance
-    );
 
     Ok(())
 }

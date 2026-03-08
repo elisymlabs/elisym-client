@@ -48,15 +48,6 @@ pub enum Commands {
         name: String,
     },
 
-    /// Request devnet/testnet SOL airdrop
-    Airdrop {
-        /// Agent name
-        name: String,
-        /// Amount of SOL to airdrop (e.g. "1.0")
-        #[arg(long, default_value = "1.0")]
-        amount: String,
-    },
-
     /// Send SOL to an address
     Send {
         /// Agent name

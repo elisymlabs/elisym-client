@@ -41,7 +41,7 @@ pub fn validate_job_price(lamports: u64) -> Option<String> {
 }
 
 /// Build a SolanaPaymentProvider directly from config (no relay connections needed).
-/// Use this for wallet-only operations: send, airdrop, balance checks.
+/// Use this for wallet-only operations: send, balance checks.
 pub fn build_solana_provider(config: &AgentConfig) -> Result<SolanaPaymentProvider> {
     let network = super::parse_network(&config.payment.network);
 
