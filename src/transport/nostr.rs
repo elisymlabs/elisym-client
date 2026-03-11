@@ -6,23 +6,29 @@ use elisym_core::types::JobStatus;
 use elisym_core::AgentNode;
 use nostr_sdk::Timestamp;
 use tokio::sync::mpsc;
-use console::style;
 
 use crate::cli::error::Result;
 use crate::cli::protocol::HeartbeatMessage;
+use crate::tui::AppEvent;
 
 use super::{IncomingJob, JobFeedbackStatus, Transport, TransportRaw};
 
 pub struct NostrTransport {
     agent: Arc<AgentNode>,
     kind_offsets: Vec<u16>,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
 }
 
 impl NostrTransport {
-    pub fn new(agent: Arc<AgentNode>, kind_offsets: Vec<u16>) -> Self {
+    pub fn new(
+        agent: Arc<AgentNode>,
+        kind_offsets: Vec<u16>,
+        event_tx: mpsc::UnboundedSender<AppEvent>,
+    ) -> Self {
         Self {
             agent,
             kind_offsets,
+            event_tx,
         }
     }
 }
@@ -43,6 +49,7 @@ impl Transport for NostrTransport {
 
         // Spawn ping/pong handler
         let agent_ping = Arc::clone(&self.agent);
+        let etx_ping = self.event_tx.clone();
         tokio::spawn(async move {
             while let Some(msg) = messages_rx.recv().await {
                 if msg.timestamp < started_at {
@@ -53,11 +60,10 @@ impl Transport for NostrTransport {
                     Err(_) => continue,
                 };
                 if heartbeat.is_ping() {
-                    let short_sender = &msg.sender.to_string()[..12.min(msg.sender.to_string().len())];
-                    println!("  {} Ping from {}... — pong sent",
-                        style("↔").dim(),
-                        style(short_sender).dim(),
-                    );
+                    let sender_str = msg.sender.to_string();
+                    let _ = etx_ping.send(AppEvent::Ping {
+                        from: sender_str,
+                    });
                     let pong = HeartbeatMessage::pong(heartbeat.nonce);
                     let _ = agent_ping
                         .messaging
@@ -158,23 +164,16 @@ impl Transport for NostrTransport {
                 Ok(_result_id) => {
                     if let Some(solana) = self.agent.solana_payments() {
                         if let Ok(balance) = solana.balance() {
-                            println!("     {} Wallet: {} SOL",
-                                style("$").dim(),
-                                style(crate::util::format_sol_compact(balance)).dim(),
-                            );
+                            let _ = self.event_tx.send(AppEvent::WalletBalance(balance));
                         }
                     }
                     return Ok(());
                 }
                 Err(e) => {
-                    if attempt < 2 {
-                        eprintln!("     {} Delivery retry {}/3...",
-                            style("↻").yellow(),
-                            attempt + 1,
-                        );
-                    }
                     last_err = Some(e);
-                    tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+                    }
                 }
             }
         }

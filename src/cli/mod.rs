@@ -4,6 +4,7 @@ mod banner;
 pub(crate) mod config;
 pub(crate) mod crypto;
 pub(crate) mod error;
+pub(crate) mod global_config;
 pub(crate) mod llm;
 pub(crate) mod protocol;
 
@@ -28,6 +29,44 @@ use self::config::{AgentConfig, LlmSection, PaymentSection};
 use self::error::{CliError, Result};
 
 use crate::util::{format_sol, format_sol_compact, sol_to_lamports};
+
+/// Initialize tracing subscriber with a reloadable filter.
+/// Returns a handle that can silence tracing when TUI is active.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::reload;
+
+    let base_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"))
+        .add_directive("nostr_relay_pool=off".parse().unwrap());
+
+    let (filter_layer, handle) = reload::Layer::new(base_filter);
+
+    let fmt_layer = tracing_subscriber::fmt::layer();
+
+    let subscriber = tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer);
+
+    let _ = tracing::subscriber::set_global_default(subscriber);
+
+    // Store the handle for later use
+    TRACING_RELOAD_HANDLE.get_or_init(|| std::sync::Mutex::new(handle));
+}
+
+static TRACING_RELOAD_HANDLE: std::sync::OnceLock<
+    std::sync::Mutex<tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>>
+> = std::sync::OnceLock::new();
+
+/// Silence all tracing output (call before TUI starts).
+fn silence_tracing() {
+    if let Some(handle) = TRACING_RELOAD_HANDLE.get() {
+        if let Ok(handle) = handle.lock() {
+            let _ = handle.reload(tracing_subscriber::EnvFilter::new("off"));
+        }
+    }
+}
 
 /// Run an async operation with an animated spinner.
 async fn with_spinner<F, T>(message: &str, fut: F) -> T
@@ -166,14 +205,7 @@ async fn fetch_models_async(provider: &str, api_key: &str) -> std::result::Resul
 }
 
 pub async fn run() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter({
-            let base = tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-            // Always suppress noisy relay pool logs (connection retries, timeouts)
-            base.add_directive("nostr_relay_pool=off".parse().unwrap())
-        })
-        .init();
+    init_tracing();
 
     let cli = Cli::parse();
 
@@ -705,12 +737,77 @@ fn cmd_config(name: &str) -> Result<()> {
                                 }
                             }
                         }
-                        // LLM provider
+                        // LLM settings
                         2 => {
-                            if let Some(llm) = prompt_llm_section()? {
-                                cfg.llm = Some(llm);
-                                save_config_encrypted(&mut cfg, &password)?;
-                                println!("  {} Provider LLM saved.", style("*").green());
+                            if let Some(ref llm) = cfg.llm {
+                                println!(
+                                    "  {} Current: {} / {}",
+                                    style("~").dim(),
+                                    style(&llm.provider).cyan(),
+                                    style(&llm.model).cyan().bold(),
+                                );
+                                let llm_options = &[
+                                    "Change model",
+                                    "Change max tokens",
+                                    "Change provider + API key",
+                                    "\u{2190} Back",
+                                ];
+                                let llm_idx = Select::new()
+                                    .with_prompt("LLM settings")
+                                    .items(llm_options)
+                                    .default(0)
+                                    .interact()?;
+
+                                match llm_idx {
+                                    // Change model only
+                                    0 => {
+                                        let llm = cfg.llm.as_ref().unwrap();
+                                        let mut models = fetch_models(&llm.provider, &llm.api_key);
+                                        // Put current model first if present
+                                        if let Some(pos) = models.iter().position(|m| m == &llm.model) {
+                                            models.swap(0, pos);
+                                        }
+                                        let model_idx = Select::new()
+                                            .with_prompt("Model")
+                                            .items(&models)
+                                            .default(0)
+                                            .interact()?;
+                                        cfg.llm.as_mut().unwrap().model = models[model_idx].clone();
+                                        save_config_encrypted(&mut cfg, &password)?;
+                                        println!(
+                                            "  {} Model set to {}",
+                                            style("*").green(),
+                                            style(&cfg.llm.as_ref().unwrap().model).cyan().bold(),
+                                        );
+                                    }
+                                    // Change max tokens
+                                    1 => {
+                                        let current = cfg.llm.as_ref().unwrap().max_tokens;
+                                        let new_tokens: u32 = Input::new()
+                                            .with_prompt("Max tokens per LLM response")
+                                            .default(current)
+                                            .interact_text()?;
+                                        cfg.llm.as_mut().unwrap().max_tokens = new_tokens;
+                                        save_config_encrypted(&mut cfg, &password)?;
+                                        println!("  {} Max tokens set to {}", style("*").green(), new_tokens);
+                                    }
+                                    // Full reconfigure
+                                    2 => {
+                                        if let Some(llm) = prompt_llm_section()? {
+                                            cfg.llm = Some(llm);
+                                            save_config_encrypted(&mut cfg, &password)?;
+                                            println!("  {} Provider LLM saved.", style("*").green());
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                // No LLM configured yet — full setup
+                                if let Some(llm) = prompt_llm_section()? {
+                                    cfg.llm = Some(llm);
+                                    save_config_encrypted(&mut cfg, &password)?;
+                                    println!("  {} Provider LLM saved.", style("*").green());
+                                }
                             }
                         }
                         // Back
@@ -1056,6 +1153,7 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
         llm: Some(llm_client),
         agent_name: cfg.name.clone(),
         agent_description: cfg.description.clone(),
+        event_tx: None, // will be replaced after event channel is created
     };
 
     let runtime_config = crate::runtime::RuntimeConfig {
@@ -1072,39 +1170,51 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
 
     let agent_node = Arc::new(agent_node);
 
-    println!();
-    println!("  {} {}",
-        style("⚡").yellow(),
-        style("Agent is live — listening for jobs").bold(),
-    );
-    println!("     {}  {}",
-        style("Skill").dim(),
-        style(&skill_name).cyan().bold(),
-    );
-    println!("     {}  {}",
-        style("Price").dim(),
-        if free {
-            style("FREE".to_string()).yellow().bold()
-        } else {
-            style(format!("{} SOL", format_sol(cfg.payment.job_price))).green().bold()
-        },
-    );
-    println!("     {}",
-        style("Press Ctrl+C to stop.").dim(),
-    );
-    println!();
+    // Get wallet balance for TUI header
+    let wallet_balance = {
+        let solana2 = agent::build_solana_provider(&cfg)?;
+        solana2.balance().unwrap_or(0)
+    };
+
+    // Silence tracing before TUI to prevent log corruption
+    silence_tracing();
+
+    // Create event channel and launch TUI
+    let (event_tx, event_rx) = crate::tui::create_event_channel();
+
+    let ctx = crate::skill::SkillContext {
+        event_tx: Some(event_tx.clone()),
+        ..ctx
+    };
 
     let runtime = crate::runtime::AgentRuntime::new(
         Arc::clone(&agent_node),
         registry,
         ctx,
         runtime_config,
+        event_tx.clone(),
     );
-    let transport = crate::transport::nostr::NostrTransport::new(
-        agent_node,
-        vec![elisym_core::DEFAULT_KIND_OFFSET],
+    let transport: Box<dyn crate::transport::Transport> = Box::new(
+        crate::transport::nostr::NostrTransport::new(
+            agent_node,
+            vec![elisym_core::DEFAULT_KIND_OFFSET],
+            event_tx,
+        ),
     );
-    runtime.run(Box::new(transport)).await?;
+
+    let gc = global_config::load_global_config();
+    let app = crate::tui::App::new(
+        name.clone(),
+        skill_name,
+        cfg.payment.job_price,
+        free,
+        wallet_balance,
+        cfg.payment.network.clone(),
+        gc.tui.sound_enabled,
+        gc.tui.sound_volume,
+    );
+
+    crate::tui::event::run_tui(app, event_rx, runtime, transport).await?;
 
     Ok(())
 }

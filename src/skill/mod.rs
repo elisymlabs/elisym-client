@@ -8,15 +8,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 use crate::cli::error::Result;
 use crate::cli::llm::LlmClient;
+use crate::tui::AppEvent;
 
 pub struct SkillInput {
     pub data: String,
     pub input_type: String,
     pub tags: Vec<String>,
     pub metadata: Value,
+    pub job_id: String,
 }
 
 pub struct SkillOutput {
@@ -28,6 +31,7 @@ pub struct SkillContext {
     pub llm: Option<Arc<LlmClient>>,
     pub agent_name: String,
     pub agent_description: String,
+    pub event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
 }
 
 #[async_trait]
@@ -113,6 +117,15 @@ mod tests {
         fn capabilities(&self) -> &[String] { &self.caps }
         async fn execute(&self, _input: SkillInput, _ctx: &SkillContext) -> Result<SkillOutput> {
             Ok(SkillOutput { data: "ok".into(), output_mime: None })
+        }
+    }
+
+    fn _dummy_ctx() -> SkillContext {
+        SkillContext {
+            llm: None,
+            agent_name: "test".into(),
+            agent_description: "test".into(),
+            event_tx: None,
         }
     }
 

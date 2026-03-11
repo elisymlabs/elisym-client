@@ -3,6 +3,7 @@ mod constants;
 pub mod runtime;
 pub mod skill;
 pub mod transport;
+pub mod tui;
 pub mod util;
 
 #[tokio::main]

@@ -2,12 +2,12 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use async_trait::async_trait;
-use console::style;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::cli::error::{CliError, Result};
 use crate::cli::llm::{CompletionResult, ToolCall, ToolDef, ToolParam};
+use crate::tui::AppEvent;
 use super::{Skill, SkillContext, SkillInput, SkillOutput};
 
 /// Maximum tool-use rounds to prevent infinite loops.
@@ -46,7 +46,7 @@ pub struct ScriptSkill {
 
 impl ScriptSkill {
     /// Run a tool command with arguments extracted from LLM's tool call.
-    async fn run_tool(&self, tool_def: &SkillToolDef, call: &ToolCall) -> Result<String> {
+    async fn run_tool(&self, tool_def: &SkillToolDef, call: &ToolCall, job_id: &str, ctx: &SkillContext) -> Result<String> {
         // Build command: base command + named args (--name value)
         // First required parameter is positional, rest are --name value
         let mut args = tool_def.command.clone();
@@ -69,10 +69,12 @@ impl ScriptSkill {
             }
         }
 
-        println!("     {} Running tool {}",
-            style("→").dim(),
-            style(&call.name).cyan(),
-        );
+        if let Some(ref tx) = ctx.event_tx {
+            let _ = tx.send(AppEvent::ToolStarted {
+                job_id: job_id.to_string(),
+                tool_name: call.name.clone(),
+            });
+        }
 
         let child = tokio::process::Command::new(&args[0])
             .args(&args[1..])
@@ -89,20 +91,24 @@ impl ScriptSkill {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("     {} Tool {} failed: {}",
-                style("✗").red(),
-                style(&call.name).red(),
-                stderr.trim(),
-            );
+            if let Some(ref tx) = ctx.event_tx {
+                let _ = tx.send(AppEvent::ToolFailed {
+                    job_id: job_id.to_string(),
+                    tool_name: call.name.clone(),
+                    error: stderr.trim().to_string(),
+                });
+            }
             return Ok(format!("Error: tool exited with {}: {}", output.status, stderr.trim()));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        println!("     {} Tool {} done ({} chars)",
-            style("←").dim(),
-            style(&call.name).cyan(),
-            stdout.len(),
-        );
+        if let Some(ref tx) = ctx.event_tx {
+            let _ = tx.send(AppEvent::ToolCompleted {
+                job_id: job_id.to_string(),
+                tool_name: call.name.clone(),
+                output_len: stdout.len(),
+            });
+        }
         Ok(stdout)
     }
 
@@ -153,10 +159,17 @@ impl Skill for ScriptSkill {
             .ok_or_else(|| CliError::Llm("no LLM configured for skill".into()))?;
 
         let tools = self.llm_tools();
+        let job_id = &input.job_id;
 
         // If no tools defined, just do a simple LLM call
         if tools.is_empty() {
-            println!("     {} Calling LLM (no tools)", style("⚙").dim());
+            if let Some(ref tx) = ctx.event_tx {
+                let _ = tx.send(AppEvent::LlmRound {
+                    job_id: job_id.clone(),
+                    round: 1,
+                    max_rounds: 1,
+                });
+            }
             let result = llm.complete(&self.system_prompt, &input.data).await?;
             return Ok(SkillOutput {
                 data: result,
@@ -171,11 +184,13 @@ impl Skill for ScriptSkill {
         })];
 
         for round in 0..MAX_TOOL_ROUNDS {
-            println!("     {} LLM round {}/{}",
-                style("⚙").dim(),
-                round + 1,
-                MAX_TOOL_ROUNDS,
-            );
+            if let Some(ref tx) = ctx.event_tx {
+                let _ = tx.send(AppEvent::LlmRound {
+                    job_id: job_id.clone(),
+                    round: round + 1,
+                    max_rounds: MAX_TOOL_ROUNDS,
+                });
+            }
 
             let result = llm
                 .complete_with_tools(&self.system_prompt, &messages, &tools)
@@ -192,18 +207,13 @@ impl Skill for ScriptSkill {
                     calls,
                     assistant_message,
                 } => {
-                    println!("     {} LLM wants {} tool call(s)",
-                        style("⚙").dim(),
-                        calls.len(),
-                    );
-
                     // Add assistant message to conversation
                     messages.push(assistant_message);
 
                     // Execute each tool and add results
                     for call in &calls {
                         let tool_result = match self.find_tool(&call.name) {
-                            Some(tool_def) => self.run_tool(tool_def, call).await?,
+                            Some(tool_def) => self.run_tool(tool_def, call, job_id, ctx).await?,
                             None => format!("Error: unknown tool '{}'", call.name),
                         };
 

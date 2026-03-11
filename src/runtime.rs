@@ -1,15 +1,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use console::style;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::cli::error::{CliError, Result};
 use crate::constants::{PROTOCOL_FEE_BPS, PROTOCOL_TREASURY};
 use crate::skill::{SkillContext, SkillInput, SkillRegistry};
 use crate::transport::{IncomingJob, JobFeedbackStatus, Transport};
-use crate::util::{format_bps_percent, format_sol_compact};
+use crate::tui::AppEvent;
 
 use elisym_core::AgentNode;
 
@@ -18,6 +17,7 @@ pub struct AgentRuntime {
     skills: SkillRegistry,
     ctx: SkillContext,
     config: RuntimeConfig,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
 }
 
 pub struct RuntimeConfig {
@@ -44,27 +44,26 @@ impl AgentRuntime {
         skills: SkillRegistry,
         ctx: SkillContext,
         config: RuntimeConfig,
+        event_tx: mpsc::UnboundedSender<AppEvent>,
     ) -> Self {
         Self {
             agent,
             skills,
             ctx,
             config,
+            event_tx,
         }
     }
 
     pub async fn run(self, transport: Box<dyn Transport>) -> Result<()> {
         let mut jobs_rx = transport.start().await?;
 
-        println!("  {} Listening for incoming jobs...",
-            style("●").green().bold(),
-        );
-
         let transport = Arc::new(transport);
         let skills = Arc::new(self.skills);
         let ctx = Arc::new(self.ctx);
         let agent = self.agent;
         let config = Arc::new(self.config);
+        let event_tx = self.event_tx;
 
         let mut tasks: JoinSet<()> = JoinSet::new();
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_jobs));
@@ -72,14 +71,11 @@ impl AgentRuntime {
         loop {
             tokio::select! {
                 Some(job) = jobs_rx.recv() => {
-                    let short_id = &job.job_id[..12.min(job.job_id.len())];
-                    let short_customer = &job.customer_id[..12.min(job.customer_id.len())];
-                    println!("\n  {} New job {}",
-                        style("▶").cyan().bold(),
-                        style(format!("{}...", short_id)).cyan(),
-                    );
-                    println!("     {}  {}...", style("From").dim(), style(short_customer).dim());
-                    println!("     {}  {} chars", style("Input").dim(), job.input.len());
+                    let _ = event_tx.send(AppEvent::JobReceived {
+                        job_id: job.job_id.clone(),
+                        customer_id: job.customer_id.clone(),
+                        input: job.input.clone(),
+                    });
 
                     let transport = Arc::clone(&transport);
                     let skills = Arc::clone(&skills);
@@ -87,49 +83,53 @@ impl AgentRuntime {
                     let agent = Arc::clone(&agent);
                     let config = Arc::clone(&config);
                     let sem = Arc::clone(&semaphore);
+                    let etx = event_tx.clone();
 
                     tasks.spawn(async move {
                         let _permit = match sem.acquire().await {
                             Ok(p) => p,
                             Err(_) => return,
                         };
-                        if let Err(e) = process_job(&agent, &skills, &ctx, &config, job, transport.as_ref().as_ref()).await {
-                            eprintln!("  {} Job failed: {}", style("✗").red().bold(), style(&e).red());
+                        let job_id = job.job_id.clone();
+                        if let Err(e) = process_job(&agent, &skills, &ctx, &config, job, transport.as_ref().as_ref(), &etx).await {
+                            let _ = etx.send(AppEvent::JobFailed {
+                                job_id,
+                                error: e.to_string(),
+                            });
                         }
                     });
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    println!("\n  {} Shutting down...", style("■").yellow().bold());
                     break;
                 }
                 Some(result) = tasks.join_next() => {
                     if let Err(e) = result {
-                        eprintln!("  {} Task panicked: {}", style("✗").red().bold(), e);
+                        let _ = event_tx.send(AppEvent::JobFailed {
+                            job_id: String::new(),
+                            error: format!("task panicked: {}", e),
+                        });
                     }
                 }
             }
             while let Some(result) = tasks.try_join_next() {
                 if let Err(e) = result {
-                        eprintln!("  {} Task panicked: {}", style("✗").red().bold(), e);
+                    let _ = event_tx.send(AppEvent::JobFailed {
+                        job_id: String::new(),
+                        error: format!("task panicked: {}", e),
+                    });
                 }
             }
         }
 
         // Drain remaining tasks with timeout
         if !tasks.is_empty() {
-            println!("  {} Waiting for {} in-flight job(s)...", style("⏳").dim(), tasks.len());
             let deadline = tokio::time::sleep(Duration::from_secs(30));
             tokio::pin!(deadline);
 
             loop {
                 tokio::select! {
-                    Some(result) = tasks.join_next() => {
-                        if let Err(e) = result {
-                            eprintln!("  {} Task panicked: {}", style("✗").red().bold(), e);
-                        }
-                    }
+                    Some(_result) = tasks.join_next() => {}
                     _ = &mut deadline => {
-                        eprintln!("  {} Timeout — aborting {} remaining task(s)", style("!").yellow().bold(), tasks.len());
                         tasks.abort_all();
                         break;
                     }
@@ -150,7 +150,6 @@ impl AgentRuntime {
             }
         }
 
-        println!("  {} Agent stopped.", style("●").dim());
         Ok(())
     }
 }
@@ -162,13 +161,13 @@ async fn process_job(
     config: &RuntimeConfig,
     job: IncomingJob,
     transport: &dyn Transport,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
 ) -> Result<()> {
-    let short_id = &job.job_id[..12.min(job.job_id.len())];
+    let job_id = job.job_id.clone();
     let amount = if config.free_mode {
-        println!("     {} Free mode — no payment", style("$").dim());
         None
     } else {
-        Some(collect_payment(agent, &job, transport, config.job_price, config.payment_timeout_secs).await?)
+        Some(collect_payment(agent, &job, transport, config.job_price, config.payment_timeout_secs, event_tx).await?)
     };
 
     // Send Processing feedback
@@ -181,22 +180,26 @@ async fn process_job(
         .route(&job.tags)
         .ok_or_else(|| CliError::Other("no skill available to handle this job".into()))?;
 
-    println!("     {} Running skill {}",
-        style("⚙").cyan(),
-        style(skill.name()).cyan().bold(),
-    );
+    let _ = event_tx.send(AppEvent::SkillStarted {
+        job_id: job_id.clone(),
+        skill_name: skill.name().to_string(),
+    });
 
     let input = SkillInput {
         data: job.input.clone(),
         input_type: job.input_type.clone(),
         tags: job.tags.clone(),
         metadata: serde_json::Value::Null,
+        job_id: job_id.clone(),
     };
 
     let output = match skill.execute(input, ctx).await {
         Ok(out) => out,
         Err(e) => {
-            eprintln!("  {} Skill error [{}...]: {}", style("✗").red().bold(), short_id, style(&e).red());
+            let _ = event_tx.send(AppEvent::JobFailed {
+                job_id: job_id.clone(),
+                error: e.to_string(),
+            });
             transport
                 .send_feedback(
                     &job,
@@ -207,13 +210,22 @@ async fn process_job(
         }
     };
 
-    println!("  {} Job {}... completed ({} chars)",
-        style("✓").green().bold(),
-        style(short_id).cyan(),
-        output.data.len(),
-    );
+    let result_len = output.data.len();
+    transport.deliver_result(&job, &output.data, amount).await?;
 
-    transport.deliver_result(&job, &output.data, amount).await
+    let _ = event_tx.send(AppEvent::JobCompleted {
+        job_id,
+        result_len,
+    });
+
+    // Update wallet balance
+    if let Some(solana) = agent.solana_payments() {
+        if let Ok(balance) = solana.balance() {
+            let _ = event_tx.send(AppEvent::WalletBalance(balance));
+        }
+    }
+
+    Ok(())
 }
 
 async fn collect_payment(
@@ -222,8 +234,9 @@ async fn collect_payment(
     transport: &dyn Transport,
     price: u64,
     payment_timeout_secs: u32,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
 ) -> Result<u64> {
-    let short_id = &job.job_id[..12.min(job.job_id.len())];
+    let job_id = job.job_id.clone();
     let payments = agent
         .payments
         .as_ref()
@@ -244,7 +257,6 @@ async fn collect_payment(
     ) {
         Ok(req) => req,
         Err(e) => {
-            eprintln!("  {} Payment request failed [{}...]: {}", style("✗").red().bold(), short_id, e);
             transport
                 .send_feedback(
                     job,
@@ -255,14 +267,14 @@ async fn collect_payment(
         }
     };
 
+    let _ = event_tx.send(AppEvent::PaymentRequested {
+        job_id: job_id.clone(),
+        price,
+        fee: fee_amount,
+    });
+
     let chain_str = payment_request.chain.to_string();
     let provider_net = price.saturating_sub(fee_amount);
-    println!("     {} Requesting payment: {} SOL (fee {} = {})",
-        style("$").yellow(),
-        style(format_sol_compact(price)).bold(),
-        format_bps_percent(PROTOCOL_FEE_BPS),
-        style(format!("{} SOL", format_sol_compact(fee_amount))).dim(),
-    );
 
     // Send PaymentRequired feedback
     transport
@@ -295,7 +307,9 @@ async fn collect_payment(
     };
 
     if !paid {
-        eprintln!("  {} Payment timeout [{}...]", style("✗").red().bold(), short_id);
+        let _ = event_tx.send(AppEvent::PaymentTimeout {
+            job_id,
+        });
         transport
             .send_feedback(
                 job,
@@ -305,10 +319,11 @@ async fn collect_payment(
         return Err(CliError::Other("payment timeout".into()));
     }
 
-    println!("     {} Payment received! You earn {} SOL (net)",
-        style("✓").green().bold(),
-        style(format_sol_compact(provider_net)).green().bold(),
-    );
+    let _ = event_tx.send(AppEvent::PaymentReceived {
+        job_id,
+        net_amount: provider_net,
+    });
+
     Ok(provider_net)
 }
 
