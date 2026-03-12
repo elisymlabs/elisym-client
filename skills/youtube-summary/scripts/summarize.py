@@ -20,7 +20,16 @@ import sys
 import tempfile
 
 CHUNK_SIZE = 30_000  # ~7500 tokens, safe for rate limits
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(SCRIPT_DIR, ".cache")
+COOKIES_FILE = os.path.join(os.path.dirname(SCRIPT_DIR), "cookies.txt")
+
+
+def _cookies_args() -> list[str]:
+    """Return yt-dlp --cookies args if cookies.txt exists."""
+    if os.path.exists(COOKIES_FILE):
+        return ["--cookies", COOKIES_FILE]
+    return []
 
 
 def video_id_from_url(url: str) -> str:
@@ -54,11 +63,21 @@ def save_cache(url: str, data: dict):
 def get_video_info(url: str) -> dict:
     """Fetch video title, duration, description, and language info."""
     result = subprocess.run(
-        ["yt-dlp", "--dump-json", "--no-download", url],
+        ["yt-dlp", "--dump-json", "--no-download", "--no-check-formats", *_cookies_args(), url],
         capture_output=True, text=True, timeout=30,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"yt-dlp failed: {result.stderr.strip()}")
+        # Fallback: return minimal info if --dump-json fails (e.g. EJS solver issues)
+        vid = video_id_from_url(url)
+        return {
+            "title": f"Video {vid}",
+            "duration": 0,
+            "channel": "Unknown",
+            "description": "",
+            "language": None,
+            "subtitles": [],
+            "automatic_captions": [],
+        }
     info = json.loads(result.stdout)
     return {
         "title": info.get("title", "Unknown"),
@@ -105,6 +124,7 @@ def _try_fetch_subs(url: str, lang: str) -> str | None:
                 "--sub-lang", lang,
                 "--sub-format", "vtt",
                 "--skip-download",
+                *_cookies_args(),
                 "-o", output_path, url,
             ],
             capture_output=True, text=True, timeout=60,
@@ -126,6 +146,7 @@ def _try_fetch_subs_any(url: str) -> str | None:
                 "--write-auto-sub", "--write-sub",
                 "--sub-format", "vtt",
                 "--skip-download",
+                *_cookies_args(),
                 "-o", output_path, url,
             ],
             capture_output=True, text=True, timeout=60,
@@ -167,7 +188,7 @@ def transcribe_audio(url: str) -> str:
         audio_path = os.path.join(tmpdir, "audio.mp3")
         print("Downloading audio...", file=sys.stderr)
         result = subprocess.run(
-            ["yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", "5", "-o", audio_path, url],
+            ["yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", "5", *_cookies_args(), "-o", audio_path, url],
             capture_output=True, text=True, timeout=300,
         )
         if result.returncode != 0:
