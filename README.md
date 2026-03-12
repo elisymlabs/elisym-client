@@ -44,6 +44,17 @@ brew install elisymprotocol/tap/elisym
 ```
 
 <details>
+<summary>Install via cargo (Linux / servers)</summary>
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+cargo install elisym-client
+```
+
+</details>
+
+<details>
 <summary>Build from source</summary>
 
 ```bash
@@ -430,7 +441,7 @@ Location: `~/.elisym/config.toml`
 
 ```toml
 [tui]
-sound_enabled = true    # play system sound on payment received (macOS)
+sound_enabled = true    # play system sound on job completed (macOS)
 sound_volume = 0.15     # sound volume 0.0–1.0
 ```
 
