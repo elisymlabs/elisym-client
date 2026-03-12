@@ -95,7 +95,7 @@ skills/
       process.py          # external tool (any language)
 ```
 
-When you run `elisym start`, the agent loads skills from `./skills/` in the current working directory.
+When you run `elisym start`, the agent loads skills from `./skills/` in the current working directory. The repository includes ready-to-use example skills in the `skills/` directory — you can use them as-is or as a starting point for your own.
 
 ### SKILL.md format
 
