@@ -129,7 +129,6 @@ pub struct App {
     pub agent_name: String,
     pub skill_name: String,
     pub price: u64,
-    pub free_mode: bool,
     pub wallet_balance: u64,
     pub network: String,
     // Sound
@@ -148,7 +147,6 @@ impl App {
         agent_name: String,
         skill_name: String,
         price: u64,
-        free_mode: bool,
         wallet_balance: u64,
         network: String,
         sound_enabled: bool,
@@ -165,7 +163,6 @@ impl App {
             agent_name,
             skill_name,
             price,
-            free_mode,
             wallet_balance,
             network,
             sound_enabled,

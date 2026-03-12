@@ -45,7 +45,7 @@ fn render_main(f: &mut Frame, app: &mut App) {
         .split(area);
 
     // ── Header ──
-    let price_str = if app.free_mode {
+    let price_str = if app.price == 0 {
         "FREE".to_string()
     } else {
         format!("{} SOL", format_sol_compact(app.price))
@@ -61,7 +61,7 @@ fn render_main(f: &mut Frame, app: &mut App) {
         Span::styled("     price: ", muted()),
         Span::styled(
             &price_str,
-            if app.free_mode {
+            if app.price == 0 {
                 Style::default().fg(WARN).bold()
             } else {
                 Style::default().fg(OK).bold()

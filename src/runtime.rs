@@ -24,7 +24,6 @@ pub struct AgentRuntime {
 }
 
 pub struct RuntimeConfig {
-    pub free_mode: bool,
     pub job_price: u64,
     pub payment_timeout_secs: u32,
     pub max_concurrent_jobs: usize,
@@ -35,7 +34,6 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            free_mode: false,
             job_price: 10_000_000,
             payment_timeout_secs: 120,
             max_concurrent_jobs: 10,
@@ -225,7 +223,7 @@ async fn process_job(
     ledger: &Mutex<JobLedger>,
 ) -> Result<()> {
     let job_id = job.job_id.clone();
-    let (amount, payment_request_str) = if config.free_mode {
+    let (amount, payment_request_str) = if config.job_price == 0 {
         (None, None)
     } else {
         let (net, pr) = collect_payment(agent, &job, transport, config.job_price, config.payment_timeout_secs, event_tx).await?;
@@ -366,7 +364,7 @@ async fn recover_pending_jobs(
         }
 
         // Verify payment is still confirmed on-chain
-        if !config.free_mode {
+        if !config.job_price == 0 {
             let still_paid = if let Some(payments) = agent.payments.as_ref() {
                 match payments.lookup_payment(&entry.payment_request) {
                     Ok(status) => status.settled,
@@ -420,7 +418,7 @@ async fn recover_pending_jobs(
             },
         };
 
-        let amount = if config.free_mode {
+        let amount = if config.job_price == 0 {
             None
         } else {
             Some(entry.net_amount)

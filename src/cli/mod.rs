@@ -208,7 +208,7 @@ pub async fn run() -> Result<()> {
 
     match cli.command {
         Some(Commands::Init) => { cmd_init()?; },
-        Some(Commands::Start { name, free }) => cmd_start(name, free).await?,
+        Some(Commands::Start { name, headless, price }) => cmd_start(name, headless, price).await?,
         Some(Commands::List) => cmd_list()?,
         Some(Commands::Status { name }) => cmd_status(&name)?,
         Some(Commands::Delete { name }) => cmd_delete(&name)?,
@@ -761,7 +761,7 @@ fn prompt_llm_section() -> Result<Option<LlmSection>> {
 
 // ── start ─────────────────────────────────────────────────────────────
 
-async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
+async fn cmd_start(name: Option<String>, headless: bool, price: Option<String>) -> Result<()> {
     let name = match name {
         Some(n) => n,
         None => select_or_create_agent()?,
@@ -781,26 +781,17 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
     println!("{}", style(banner::BANNER).cyan());
     println!("  Starting agent {}...\n", style(&name).cyan().bold());
 
-    if free {
-        println!(
-            "  {} FREE MODE — payments disabled, jobs processed for free\n",
-            style("!").yellow().bold()
-        );
-    }
-
     // Show wallet status (no relay connection needed)
     let solana = agent::build_solana_provider(&cfg)?;
     display_wallet_status(&solana, &cfg)?;
 
-    if !free {
-        let balance = solana.balance().unwrap_or(0);
-        if balance == 0 && cfg.payment.network != "mainnet" {
-            println!(
-                "\n  {} Wallet is empty. Get devnet SOL: {}",
-                style("!").yellow(),
-                style("https://faucet.solana.com").cyan()
-            );
-        }
+    let balance = solana.balance().unwrap_or(0);
+    if balance == 0 && cfg.payment.network != "mainnet" {
+        println!(
+            "\n  {} Wallet is empty. Get devnet SOL: {}",
+            style("!").yellow(),
+            style("https://faucet.solana.com").cyan()
+        );
     }
     drop(solana);
 
@@ -866,9 +857,33 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
     let skill_caps: Vec<String> = selected_skill.capabilities().to_vec();
     registry.register(selected_skill);
 
-    // ── Price prompt ───────────────────────────────────────────
-    if !free {
-        println!("  {}", style("How much to charge per job (in SOL). 3% protocol fee is deducted.").dim());
+    // ── Price ──────────────────────────────────────────────────
+    if let Some(ref price_str) = price {
+        // --price flag: set price without interactive prompt (--price 0 = free mode)
+        let lamports = sol_to_lamports(price_str)
+            .ok_or_else(|| CliError::Other(format!("invalid --price value: {}", price_str)))?;
+        if let Some(err) = agent::validate_job_price(lamports) {
+            return Err(CliError::Other(err));
+        }
+        if lamports != cfg.payment.job_price {
+            cfg.payment.job_price = lamports;
+            save_config_encrypted(&mut cfg, &enc_password)?;
+        }
+        if cfg.payment.job_price == 0 {
+            println!(
+                "  {} FREE MODE — payments disabled, jobs processed for free\n",
+                style("!").yellow().bold()
+            );
+        } else {
+            println!(
+                "  {} Price: {} SOL per job\n",
+                style("*").green(),
+                style(format_sol(cfg.payment.job_price)).green().bold()
+            );
+        }
+    } else {
+        // Interactive price prompt
+        println!("  {}", style("How much to charge per job (in SOL). 3% protocol fee is deducted. Enter 0 for free mode.").dim());
         loop {
             let price_input: String = Input::new()
                 .with_prompt("Job price in SOL")
@@ -885,11 +900,18 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
                         cfg.payment.job_price = new_price;
                         save_config_encrypted(&mut cfg, &enc_password)?;
                     }
-                    println!(
-                        "  {} Price: {} SOL per job\n",
-                        style("*").green(),
-                        style(format_sol(cfg.payment.job_price)).green().bold()
-                    );
+                    if cfg.payment.job_price == 0 {
+                        println!(
+                            "  {} FREE MODE — payments disabled\n",
+                            style("!").yellow().bold()
+                        );
+                    } else {
+                        println!(
+                            "  {} Price: {} SOL per job\n",
+                            style("*").green(),
+                            style(format_sol(cfg.payment.job_price)).green().bold()
+                        );
+                    }
                     break;
                 }
                 _ => {
@@ -918,7 +940,6 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
     };
 
     let runtime_config = crate::runtime::RuntimeConfig {
-        free_mode: free,
         job_price: cfg.payment.job_price,
         payment_timeout_secs: cfg.payment.payment_timeout_secs,
         max_concurrent_jobs: 10,
@@ -939,20 +960,16 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
         solana2.balance().unwrap_or(0)
     };
 
-    // Silence tracing before TUI to prevent log corruption
-    silence_tracing();
-
-    // Create event channel and launch TUI
     let (event_tx, event_rx) = crate::tui::create_event_channel();
+
+    let ledger = Arc::new(tokio::sync::Mutex::new(
+        crate::ledger::JobLedger::open(&name)?,
+    ));
 
     let ctx = crate::skill::SkillContext {
         event_tx: Some(event_tx.clone()),
         ..ctx
     };
-
-    let ledger = Arc::new(tokio::sync::Mutex::new(
-        crate::ledger::JobLedger::open(&name)?,
-    ));
 
     let runtime = crate::runtime::AgentRuntime::new(
         Arc::clone(&agent_node),
@@ -966,25 +983,44 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
         crate::transport::nostr::NostrTransport::new(
             agent_node,
             vec![elisym_core::DEFAULT_KIND_OFFSET],
-            event_tx,
+            event_tx.clone(),
             cfg.recovery.delivery_retries,
         ),
     );
 
-    let gc = global_config::load_global_config();
-    let mut app = crate::tui::App::new(
-        name.clone(),
-        skill_name,
-        cfg.payment.job_price,
-        free,
-        wallet_balance,
-        cfg.payment.network.clone(),
-        gc.tui.sound_enabled,
-        gc.tui.sound_volume,
-    );
-    app.set_ledger(Arc::clone(&ledger));
+    if headless {
+        // Headless mode: run runtime directly, logs go to stdout
+        println!("  {} Running in headless mode (no TUI)\n", style("*").green());
 
-    crate::tui::event::run_tui(app, event_rx, runtime, transport).await?;
+        // Drain events to log and prevent channel backpressure
+        let mut event_rx = event_rx;
+        let log_handle = tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                log_event(&event);
+            }
+        });
+
+        let result = runtime.run(transport).await;
+        drop(log_handle);
+        result?;
+    } else {
+        // Silence tracing before TUI to prevent log corruption
+        silence_tracing();
+
+        let gc = global_config::load_global_config();
+        let mut app = crate::tui::App::new(
+            name.clone(),
+            skill_name,
+            cfg.payment.job_price,
+            wallet_balance,
+            cfg.payment.network.clone(),
+            gc.tui.sound_enabled,
+            gc.tui.sound_volume,
+        );
+        app.set_ledger(Arc::clone(&ledger));
+
+        crate::tui::event::run_tui(app, event_rx, runtime, transport).await?;
+    }
 
     Ok(())
 }
@@ -1249,6 +1285,52 @@ fn unlock_config(cfg: &mut config::AgentConfig) -> Result<()> {
         }
     }
     unreachable!()
+}
+
+/// Log an AppEvent to stdout in headless mode.
+fn log_event(event: &crate::tui::AppEvent) {
+    use crate::tui::AppEvent;
+    match event {
+        AppEvent::JobReceived { job_id, customer_id, .. } => {
+            println!("[job] received {} from {}", &job_id[..12.min(job_id.len())], &customer_id[..12.min(customer_id.len())]);
+        }
+        AppEvent::PaymentRequested { job_id, price, fee } => {
+            println!("[job] {} requesting payment: {} lamports (fee {})", &job_id[..12.min(job_id.len())], price, fee);
+        }
+        AppEvent::PaymentReceived { job_id, net_amount } => {
+            println!("[job] {} payment received: {} lamports", &job_id[..12.min(job_id.len())], net_amount);
+        }
+        AppEvent::PaymentTimeout { job_id } => {
+            println!("[job] {} payment timeout", &job_id[..12.min(job_id.len())]);
+        }
+        AppEvent::SkillStarted { job_id, skill_name } => {
+            println!("[job] {} skill started: {}", &job_id[..12.min(job_id.len())], skill_name);
+        }
+        AppEvent::LlmRound { job_id, round, max_rounds } => {
+            println!("[job] {} LLM round {}/{}", &job_id[..12.min(job_id.len())], round, max_rounds);
+        }
+        AppEvent::ToolStarted { job_id, tool_name } => {
+            println!("[job] {} tool started: {}", &job_id[..12.min(job_id.len())], tool_name);
+        }
+        AppEvent::ToolCompleted { job_id, tool_name, output_len } => {
+            println!("[job] {} tool completed: {} ({} bytes)", &job_id[..12.min(job_id.len())], tool_name, output_len);
+        }
+        AppEvent::ToolFailed { job_id, tool_name, error } => {
+            println!("[job] {} tool failed: {} — {}", &job_id[..12.min(job_id.len())], tool_name, error);
+        }
+        AppEvent::JobCompleted { job_id, result_len } => {
+            println!("[job] {} completed ({} bytes)", &job_id[..12.min(job_id.len())], result_len);
+        }
+        AppEvent::JobFailed { job_id, error } => {
+            println!("[job] {} failed: {}", &job_id[..12.min(job_id.len())], error);
+        }
+        AppEvent::WalletBalance(bal) => {
+            println!("[wallet] balance: {} lamports", bal);
+        }
+        AppEvent::Ping { from } => {
+            println!("[ping] from {}", &from[..12.min(from.len())]);
+        }
+    }
 }
 
 /// Save config, re-encrypting secrets if a password is provided.

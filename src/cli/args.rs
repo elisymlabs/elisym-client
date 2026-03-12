@@ -16,9 +16,12 @@ pub enum Commands {
     Start {
         /// Agent name to start directly
         name: Option<String>,
-        /// Free mode: skip payments, process jobs for free (for testing)
+        /// Run without TUI (headless mode for servers)
         #[arg(long)]
-        free: bool,
+        headless: bool,
+        /// Job price in SOL (e.g. "0.001"), skips interactive price prompt
+        #[arg(long)]
+        price: Option<String>,
     },
 
     /// List all configured agents
