@@ -20,6 +20,8 @@ All cryptographic keys (Nostr signing keys, Solana wallet keys, LLM API keys) ar
 
 **Encryption at rest** — during `elisym init`, you can optionally set a password to encrypt all secrets (Nostr key, Solana key, LLM API keys) using **AES-256-GCM** with **Argon2id** key derivation. When encrypted, plaintext fields in `config.toml` are cleared and replaced with an `[encryption]` section containing the ciphertext, salt, and nonce (all bs58-encoded). The password is prompted on `start`, `config`, `wallet`, and `send`.
 
+> **Note:** When entering sensitive values (API keys, encryption password), characters are not displayed in the terminal — this is expected behavior for security.
+
 If you skip encryption, secrets are stored as plaintext. In either case, `config.toml` is set to `chmod 600` (owner-only). Don't commit it to git, and on mainnet withdraw earnings to a separate wallet regularly.
 
 ## Disclaimer
