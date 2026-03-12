@@ -139,6 +139,8 @@ pub struct App {
     pub recovery_entries: Vec<crate::ledger::LedgerEntry>,
     pub recovery_table_state: TableState,
     pub recovery_detail_scroll: u16,
+    /// Channel to trigger immediate recovery sweep in the runtime.
+    pub retry_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
 impl App {
@@ -171,11 +173,73 @@ impl App {
             recovery_entries: Vec::new(),
             recovery_table_state: TableState::default(),
             recovery_detail_scroll: 0,
+            retry_tx: None,
         }
     }
 
     pub fn set_ledger(&mut self, ledger: std::sync::Arc<tokio::sync::Mutex<crate::ledger::JobLedger>>) {
         self.ledger = Some(ledger);
+    }
+
+    pub fn set_retry_tx(&mut self, tx: mpsc::UnboundedSender<String>) {
+        self.retry_tx = Some(tx);
+    }
+
+    /// Retry the currently selected recovery entry.
+    /// Resets Failed → Paid/Executed in ledger and triggers immediate recovery sweep.
+    pub fn retry_selected(&mut self) -> bool {
+        let idx = match self.recovery_table_state.selected() {
+            Some(i) => i,
+            None => return false,
+        };
+        let entry = match self.recovery_entries.get(idx) {
+            Some(e) => e,
+            None => return false,
+        };
+
+        let job_id = entry.job_id.clone();
+        let status = entry.status.clone();
+
+        if matches!(status, crate::ledger::LedgerStatus::Delivered) {
+            return false;
+        }
+
+        let ledger = match self.ledger {
+            Some(ref l) => l.clone(),
+            None => return false,
+        };
+
+        let mut lg = match ledger.try_lock() {
+            Ok(lg) => lg,
+            Err(_) => return false,
+        };
+
+        let reset = match status {
+            crate::ledger::LedgerStatus::Failed => {
+                lg.reset_for_retry(&job_id).unwrap_or(false)
+            }
+            crate::ledger::LedgerStatus::Paid | crate::ledger::LedgerStatus::Executed => {
+                // Already pending — just reset retry count to give it fresh attempts
+                let _ = lg.increment_retry(&job_id);
+                true
+            }
+            _ => false,
+        };
+
+        if reset {
+            // Refresh the view while we still hold the lock
+            self.recovery_entries = lg.all_entries();
+            drop(lg);
+
+            // Notify runtime to run recovery sweep now
+            if let Some(ref tx) = self.retry_tx {
+                let _ = tx.send(job_id.clone());
+            }
+            self.add_global_log("↻", format!("Manual retry queued: {}...", &job_id[..12.min(job_id.len())]));
+            return true;
+        }
+
+        false
     }
 
     /// Refresh recovery entries from ledger (called when opening recovery screen).

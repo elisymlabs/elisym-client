@@ -148,8 +148,14 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         },
         Screen::Recovery => match code {
             KeyCode::Char('q') => return true,
-            KeyCode::Esc | KeyCode::Char('r') => {
+            KeyCode::Esc => {
                 app.screen = Screen::Main;
+            }
+            KeyCode::Char('r') => {
+                app.refresh_recovery();
+            }
+            KeyCode::Enter => {
+                app.retry_selected();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let len = app.recovery_entries.len();

@@ -148,6 +148,24 @@ impl JobLedger {
         Ok(())
     }
 
+    /// Reset a failed job back to Paid status for manual retry.
+    /// Resets retry_count to 0 so it gets a fresh set of attempts.
+    pub fn reset_for_retry(&mut self, job_id: &str) -> Result<bool> {
+        if let Some(entry) = self.entries.get_mut(job_id) {
+            if entry.status == LedgerStatus::Failed {
+                entry.status = if entry.result.is_some() {
+                    LedgerStatus::Executed
+                } else {
+                    LedgerStatus::Paid
+                };
+                entry.retry_count = 0;
+                self.flush()?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Increment retry count for a job.
     pub fn increment_retry(&mut self, job_id: &str) -> Result<()> {
         if let Some(entry) = self.entries.get_mut(job_id) {

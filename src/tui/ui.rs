@@ -468,7 +468,7 @@ fn render_recovery(f: &mut Frame, app: &mut App) {
         .filter(|e| e.status == crate::ledger::LedgerStatus::Paid || e.status == crate::ledger::LedgerStatus::Executed)
         .count();
     let title = Line::from(vec![
-        Span::styled("  ⚡ RECOVERY LEDGER", Style::default().fg(WARN).bold()),
+        Span::styled("  ⚡RECOVERY LEDGER", Style::default().fg(WARN).bold()),
         Span::styled(format!("  {} total, {} pending", app.recovery_entries.len(), pending), muted()),
     ]);
     f.render_widget(Paragraph::new(title), chunks[0]);
@@ -688,6 +688,8 @@ fn render_recovery(f: &mut Frame, app: &mut App) {
         Span::styled(" back  ", muted()),
         Span::styled("↑↓", Style::default().fg(FG).bold()),
         Span::styled(" select  ", muted()),
+        Span::styled("Enter", Style::default().fg(FG).bold()),
+        Span::styled(" retry  ", muted()),
         Span::styled("r", Style::default().fg(FG).bold()),
         Span::styled(" refresh", muted()),
     ]);
@@ -701,6 +703,7 @@ fn icon_style(icon: &str) -> Style {
         "✓" => Style::default().fg(OK),
         "✗" => Style::default().fg(ERR),
         "⚙" => Style::default().fg(ACCENT),
+        "↻" => Style::default().fg(WARN),
         "→" | "←" | "↔" => muted(),
         _ => Style::default(),
     }

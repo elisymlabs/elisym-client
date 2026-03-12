@@ -854,6 +854,7 @@ async fn cmd_start(name: Option<String>, headless: bool, price: Option<String>) 
 
     let mut registry = crate::skill::SkillRegistry::new();
     let skill_name = selected_skill.name().to_string();
+    let skill_description = selected_skill.description().to_string();
     let skill_caps: Vec<String> = selected_skill.capabilities().to_vec();
     registry.register(selected_skill);
 
@@ -921,9 +922,17 @@ async fn cmd_start(name: Option<String>, headless: bool, price: Option<String>) 
         }
     }
 
-    // Update config capabilities from skill
+    // Update config description and capabilities from skill
+    let mut skill_config_changed = false;
+    if skill_description != cfg.description {
+        cfg.description = skill_description;
+        skill_config_changed = true;
+    }
     if skill_caps != cfg.capabilities {
         cfg.capabilities = skill_caps.clone();
+        skill_config_changed = true;
+    }
+    if skill_config_changed {
         save_config_encrypted(&mut cfg, &enc_password)?;
     }
 
@@ -971,7 +980,7 @@ async fn cmd_start(name: Option<String>, headless: bool, price: Option<String>) 
         ..ctx
     };
 
-    let runtime = crate::runtime::AgentRuntime::new(
+    let mut runtime = crate::runtime::AgentRuntime::new(
         Arc::clone(&agent_node),
         registry,
         ctx,
@@ -1007,6 +1016,10 @@ async fn cmd_start(name: Option<String>, headless: bool, price: Option<String>) 
         // Silence tracing before TUI to prevent log corruption
         silence_tracing();
 
+        // Create retry channel for manual recovery from TUI
+        let (retry_tx, retry_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        runtime.set_retry_rx(retry_rx);
+
         let gc = global_config::load_global_config();
         let mut app = crate::tui::App::new(
             name.clone(),
@@ -1018,6 +1031,7 @@ async fn cmd_start(name: Option<String>, headless: bool, price: Option<String>) 
             gc.tui.sound_volume,
         );
         app.set_ledger(Arc::clone(&ledger));
+        app.set_retry_tx(retry_tx);
 
         crate::tui::event::run_tui(app, event_rx, runtime, transport).await?;
     }

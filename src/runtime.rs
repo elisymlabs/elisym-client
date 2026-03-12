@@ -21,6 +21,7 @@ pub struct AgentRuntime {
     config: RuntimeConfig,
     event_tx: mpsc::UnboundedSender<AppEvent>,
     ledger: Arc<Mutex<JobLedger>>,
+    retry_rx: Option<mpsc::UnboundedReceiver<String>>,
 }
 
 pub struct RuntimeConfig {
@@ -59,7 +60,12 @@ impl AgentRuntime {
             config,
             event_tx,
             ledger,
+            retry_rx: None,
         }
+    }
+
+    pub fn set_retry_rx(&mut self, rx: mpsc::UnboundedReceiver<String>) {
+        self.retry_rx = Some(rx);
     }
 
     pub async fn run(self, transport: Box<dyn Transport>) -> Result<()> {
@@ -72,6 +78,7 @@ impl AgentRuntime {
         let config = Arc::new(self.config);
         let event_tx = self.event_tx;
         let ledger = self.ledger;
+        let mut retry_rx = self.retry_rx;
 
         let mut tasks: JoinSet<()> = JoinSet::new();
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_jobs));
@@ -152,6 +159,19 @@ impl AgentRuntime {
                             });
                         }
                     });
+                }
+                Some(_job_id) = async { match retry_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
+                    // Manual retry triggered from TUI — run immediate recovery sweep
+                    recover_pending_jobs(
+                        &ledger,
+                        &agent,
+                        &skills,
+                        &ctx,
+                        &config,
+                        transport.as_ref().as_ref(),
+                        &event_tx,
+                    )
+                    .await;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     break;
