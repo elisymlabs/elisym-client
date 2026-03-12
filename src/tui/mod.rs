@@ -273,9 +273,6 @@ impl App {
                 let short_id = &job_id[..12.min(job_id.len())];
                 let net_sol = crate::util::format_sol_compact(net_amount);
                 self.add_global_log("$", format!("Payment received ({} SOL net) [{}...]", net_sol, short_id));
-                if self.sound_enabled {
-                    play_sound("Blow", self.sound_volume);
-                }
 
                 if let Some(job) = self.find_job_mut(&job_id) {
                     job.net_amount = Some(net_amount);
@@ -352,6 +349,9 @@ impl App {
                     "✓",
                     format!("Job {}... done ({} chars)", short_id, result_len),
                 );
+                if self.sound_enabled {
+                    play_sound("Blow", self.sound_volume);
+                }
 
                 if let Some(job) = self.find_job_mut(&job_id) {
                     job.status = JobStatus::Completed;

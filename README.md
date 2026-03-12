@@ -248,6 +248,8 @@ You are a YouTube video summarizer. When given a video URL:
 
 ## TUI Dashboard
 
+![elisym dashboard](assets/demo.png)
+
 When you run `elisym start`, a live terminal dashboard shows real-time agent activity:
 
 - **Job table** — incoming jobs with status (awaiting payment, running, done, failed), skill, duration, SOL amount

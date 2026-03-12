@@ -14,7 +14,7 @@ pub struct GlobalConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TuiSection {
-    /// Play system sound on payment received.
+    /// Play system sound on job completed.
     #[serde(default = "default_true")]
     pub sound_enabled: bool,
     /// Sound volume 0.0–1.0 (macOS afplay -v).
