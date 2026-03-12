@@ -27,6 +27,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::Main => render_main(f, app),
         Screen::JobDetail(idx) => render_detail(f, app, idx),
+        Screen::Recovery => render_recovery(f, app),
     }
 }
 
@@ -276,6 +277,8 @@ fn render_main(f: &mut Frame, app: &mut App) {
         Span::styled(" detail  ", muted()),
         Span::styled("Tab", Style::default().fg(FG).bold()),
         Span::styled(" switch pane  ", muted()),
+        Span::styled("r", Style::default().fg(FG).bold()),
+        Span::styled(" recovery  ", muted()),
         Span::styled("s", Style::default().fg(FG).bold()),
         Span::styled(
             format!(" {}  ", sound_label),
@@ -445,6 +448,250 @@ fn render_detail(f: &mut Frame, app: &mut App, job_idx: usize) {
         Span::styled(" scroll", muted()),
     ]);
     f.render_widget(Paragraph::new(help), chunks[2]);
+}
+
+fn render_recovery(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Percentage(40), // table
+            Constraint::Min(5),   // detail
+            Constraint::Length(1), // help
+        ])
+        .split(area);
+
+    // ── Title ──
+    let pending = app.recovery_entries.iter()
+        .filter(|e| e.status == crate::ledger::LedgerStatus::Paid || e.status == crate::ledger::LedgerStatus::Executed)
+        .count();
+    let title = Line::from(vec![
+        Span::styled("  ⚡ RECOVERY LEDGER", Style::default().fg(WARN).bold()),
+        Span::styled(format!("  {} total, {} pending", app.recovery_entries.len(), pending), muted()),
+    ]);
+    f.render_widget(Paragraph::new(title), chunks[0]);
+
+    // ── Table ──
+    let header_row = Row::new(vec![
+        Cell::from(" # "),
+        Cell::from("Job ID"),
+        Cell::from("Status"),
+        Cell::from("Retries"),
+        Cell::from("Customer"),
+        Cell::from("Age"),
+    ])
+    .style(Style::default().bold().fg(FG))
+    .bottom_margin(0);
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let rows: Vec<Row> = app
+        .recovery_entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let short_id = if entry.job_id.len() > 12 {
+                format!("{}…", &entry.job_id[..12])
+            } else {
+                entry.job_id.clone()
+            };
+            let short_customer = if entry.customer_id.len() > 12 {
+                format!("{}…", &entry.customer_id[..12])
+            } else {
+                entry.customer_id.clone()
+            };
+
+            let (status_text, status_style) = match &entry.status {
+                crate::ledger::LedgerStatus::Paid => ("$ Paid", Style::default().fg(WARN)),
+                crate::ledger::LedgerStatus::Executed => ("⚙ Executed", Style::default().fg(ACCENT)),
+                crate::ledger::LedgerStatus::Delivered => ("✓ Delivered", Style::default().fg(OK)),
+                crate::ledger::LedgerStatus::Failed => ("✗ Failed", Style::default().fg(ERR)),
+            };
+
+            let age_secs = now_secs.saturating_sub(entry.created_at);
+            let age_str = if age_secs >= 86400 {
+                format!("{}d", age_secs / 86400)
+            } else if age_secs >= 3600 {
+                format!("{}h", age_secs / 3600)
+            } else if age_secs >= 60 {
+                format!("{}m", age_secs / 60)
+            } else {
+                format!("{}s", age_secs)
+            };
+
+            let row_style = if i % 2 == 1 { muted() } else { Style::default() };
+
+            Row::new(vec![
+                Cell::from(format!("{:>2}", i + 1)).style(muted()),
+                Cell::from(short_id).style(Style::default().fg(FG)),
+                Cell::from(status_text).style(status_style),
+                Cell::from(format!("{:>4}", entry.retry_count)).style(
+                    if entry.retry_count > 0 { Style::default().fg(WARN) } else { muted() }
+                ),
+                Cell::from(short_customer).style(muted()),
+                Cell::from(format!("{:>5}", age_str)).style(muted()),
+            ])
+            .style(row_style)
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(4),       // #
+            Constraint::Min(16),         // Job ID
+            Constraint::Length(12),      // Status
+            Constraint::Length(8),       // Retries
+            Constraint::Min(16),         // Customer
+            Constraint::Length(7),       // Age
+        ],
+    )
+    .header(header_row)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .title(" Ledger entries "),
+    )
+    .row_highlight_style(
+        Style::default()
+            .add_modifier(Modifier::REVERSED)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    f.render_stateful_widget(table, chunks[1], &mut app.recovery_table_state);
+
+    // Empty state
+    if app.recovery_entries.is_empty() {
+        let inner = chunks[1].inner(Margin::new(1, 1));
+        let empty = Paragraph::new("  No ledger entries — no paid jobs recorded yet.")
+            .style(muted().add_modifier(Modifier::ITALIC))
+            .alignment(Alignment::Left);
+        if inner.height > 2 {
+            let empty_area = Rect {
+                x: inner.x,
+                y: inner.y + 1,
+                width: inner.width,
+                height: 1,
+            };
+            f.render_widget(empty, empty_area);
+        }
+    }
+
+    // ── Detail pane (selected entry) ──
+    let detail_lines: Vec<Line> = if let Some(idx) = app.recovery_table_state.selected() {
+        if let Some(entry) = app.recovery_entries.get(idx) {
+            let status_str = match &entry.status {
+                crate::ledger::LedgerStatus::Paid => "Paid (awaiting execution)",
+                crate::ledger::LedgerStatus::Executed => "Executed (awaiting delivery)",
+                crate::ledger::LedgerStatus::Delivered => "Delivered (completed)",
+                crate::ledger::LedgerStatus::Failed => "Failed (gave up)",
+            };
+
+            let age_secs = now_secs.saturating_sub(entry.created_at);
+            let age_str = if age_secs >= 86400 {
+                format!("{}d {}h ago", age_secs / 86400, (age_secs % 86400) / 3600)
+            } else if age_secs >= 3600 {
+                format!("{}h {}m ago", age_secs / 3600, (age_secs % 3600) / 60)
+            } else {
+                format!("{}m ago", age_secs / 60)
+            };
+
+            let net_sol = crate::util::format_sol_compact(entry.net_amount);
+
+            let input_preview = if entry.input.len() > 80 {
+                format!("{}…", &entry.input[..80])
+            } else {
+                entry.input.clone()
+            };
+            let input_preview = input_preview.replace('\n', " ");
+
+            let has_result = entry.result.as_ref().map(|r| format!("yes ({} chars)", r.len())).unwrap_or_else(|| "no".into());
+
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled("  Job ID:    ", muted()),
+                    Span::styled(&entry.job_id, Style::default().fg(FG)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Customer:  ", muted()),
+                    Span::styled(&entry.customer_id, Style::default().fg(FG)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Status:    ", muted()),
+                    Span::styled(status_str, match &entry.status {
+                        crate::ledger::LedgerStatus::Paid => Style::default().fg(WARN),
+                        crate::ledger::LedgerStatus::Executed => Style::default().fg(ACCENT),
+                        crate::ledger::LedgerStatus::Delivered => Style::default().fg(OK),
+                        crate::ledger::LedgerStatus::Failed => Style::default().fg(ERR),
+                    }),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Net SOL:   ", muted()),
+                    Span::styled(format!("{} SOL", net_sol), Style::default().fg(WARN)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Retries:   ", muted()),
+                    Span::styled(format!("{}/5", entry.retry_count), if entry.retry_count >= 5 {
+                        Style::default().fg(ERR)
+                    } else {
+                        Style::default().fg(FG)
+                    }),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Created:   ", muted()),
+                    Span::styled(age_str, Style::default().fg(FG)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Result:    ", muted()),
+                    Span::styled(has_result, Style::default().fg(FG)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Input:     ", muted()),
+                    Span::styled(input_preview, Style::default().fg(FG)),
+                ]),
+            ];
+
+            if !entry.tags.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("  Tags:      ", muted()),
+                    Span::styled(entry.tags.join(", "), Style::default().fg(ACCENT)),
+                ]));
+            }
+
+            lines
+        } else {
+            vec![Line::from(Span::styled("  Select an entry above", muted()))]
+        }
+    } else {
+        vec![Line::from(Span::styled("  Select an entry above", muted()))]
+    };
+
+    let detail = Paragraph::new(detail_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT))
+                .title(" Detail "),
+        )
+        .scroll((app.recovery_detail_scroll, 0));
+    f.render_widget(detail, chunks[2]);
+
+    // ── Help ──
+    let help = Line::from(vec![
+        Span::styled("  Esc", Style::default().fg(FG).bold()),
+        Span::styled(" back  ", muted()),
+        Span::styled("↑↓", Style::default().fg(FG).bold()),
+        Span::styled(" select  ", muted()),
+        Span::styled("r", Style::default().fg(FG).bold()),
+        Span::styled(" refresh", muted()),
+    ]);
+    f.render_widget(Paragraph::new(help), chunks[3]);
 }
 
 fn icon_style(icon: &str) -> Style {

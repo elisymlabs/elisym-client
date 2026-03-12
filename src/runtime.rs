@@ -1,16 +1,23 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::cli::error::{CliError, Result};
 use crate::constants::{PROTOCOL_FEE_BPS, PROTOCOL_TREASURY};
+use crate::ledger::{JobLedger, LedgerStatus};
 use crate::skill::{SkillContext, SkillInput, SkillRegistry};
-use crate::transport::{IncomingJob, JobFeedbackStatus, Transport};
+use crate::transport::{IncomingJob, JobFeedbackStatus, Transport, TransportRaw};
 use crate::tui::AppEvent;
 
 use elisym_core::AgentNode;
+
+/// How often the recovery sweep runs (seconds).
+const RECOVERY_INTERVAL_SECS: u64 = 60;
+
+/// Maximum retry attempts before marking a job as permanently failed.
+const MAX_RETRIES: u32 = 5;
 
 pub struct AgentRuntime {
     agent: Arc<AgentNode>,
@@ -18,6 +25,7 @@ pub struct AgentRuntime {
     ctx: SkillContext,
     config: RuntimeConfig,
     event_tx: mpsc::UnboundedSender<AppEvent>,
+    ledger: Arc<Mutex<JobLedger>>,
 }
 
 pub struct RuntimeConfig {
@@ -45,6 +53,7 @@ impl AgentRuntime {
         ctx: SkillContext,
         config: RuntimeConfig,
         event_tx: mpsc::UnboundedSender<AppEvent>,
+        ledger: Arc<Mutex<JobLedger>>,
     ) -> Self {
         Self {
             agent,
@@ -52,6 +61,7 @@ impl AgentRuntime {
             ctx,
             config,
             event_tx,
+            ledger,
         }
     }
 
@@ -64,9 +74,54 @@ impl AgentRuntime {
         let agent = self.agent;
         let config = Arc::new(self.config);
         let event_tx = self.event_tx;
+        let ledger = self.ledger;
 
         let mut tasks: JoinSet<()> = JoinSet::new();
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_jobs));
+
+        // Run startup recovery
+        recover_pending_jobs(
+            &ledger,
+            &agent,
+            &skills,
+            &ctx,
+            &config,
+            transport.as_ref().as_ref(),
+            &event_tx,
+        )
+        .await;
+
+        // GC old entries (older than 7 days)
+        {
+            let mut lg = ledger.lock().await;
+            let _ = lg.gc(7 * 24 * 3600);
+        }
+
+        // Spawn periodic recovery sweep
+        let recovery_transport = Arc::clone(&transport);
+        let recovery_skills = Arc::clone(&skills);
+        let recovery_ctx = Arc::clone(&ctx);
+        let recovery_agent = Arc::clone(&agent);
+        let recovery_config = Arc::clone(&config);
+        let recovery_etx = event_tx.clone();
+        let recovery_ledger = Arc::clone(&ledger);
+        let recovery_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(RECOVERY_INTERVAL_SECS));
+            interval.tick().await; // skip first immediate tick
+            loop {
+                interval.tick().await;
+                recover_pending_jobs(
+                    &recovery_ledger,
+                    &recovery_agent,
+                    &recovery_skills,
+                    &recovery_ctx,
+                    &recovery_config,
+                    recovery_transport.as_ref().as_ref(),
+                    &recovery_etx,
+                )
+                .await;
+            }
+        });
 
         loop {
             tokio::select! {
@@ -84,6 +139,7 @@ impl AgentRuntime {
                     let config = Arc::clone(&config);
                     let sem = Arc::clone(&semaphore);
                     let etx = event_tx.clone();
+                    let ledger = Arc::clone(&ledger);
 
                     tasks.spawn(async move {
                         let _permit = match sem.acquire().await {
@@ -91,7 +147,7 @@ impl AgentRuntime {
                             Err(_) => return,
                         };
                         let job_id = job.job_id.clone();
-                        if let Err(e) = process_job(&agent, &skills, &ctx, &config, job, transport.as_ref().as_ref(), &etx).await {
+                        if let Err(e) = process_job(&agent, &skills, &ctx, &config, job, transport.as_ref().as_ref(), &etx, &ledger).await {
                             let _ = etx.send(AppEvent::JobFailed {
                                 job_id,
                                 error: e.to_string(),
@@ -120,6 +176,9 @@ impl AgentRuntime {
                 }
             }
         }
+
+        // Stop recovery sweep
+        recovery_handle.abort();
 
         // Drain remaining tasks with timeout
         if !tasks.is_empty() {
@@ -154,6 +213,7 @@ impl AgentRuntime {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_job(
     agent: &AgentNode,
     skills: &SkillRegistry,
@@ -162,13 +222,36 @@ async fn process_job(
     job: IncomingJob,
     transport: &dyn Transport,
     event_tx: &mpsc::UnboundedSender<AppEvent>,
+    ledger: &Mutex<JobLedger>,
 ) -> Result<()> {
     let job_id = job.job_id.clone();
-    let amount = if config.free_mode {
-        None
+    let (amount, payment_request_str) = if config.free_mode {
+        (None, None)
     } else {
-        Some(collect_payment(agent, &job, transport, config.job_price, config.payment_timeout_secs, event_tx).await?)
+        let (net, pr) = collect_payment(agent, &job, transport, config.job_price, config.payment_timeout_secs, event_tx).await?;
+        (Some(net), Some(pr))
     };
+
+    // Record in ledger after payment confirmed (before execution)
+    if let Some(ref pr) = payment_request_str {
+        let raw_json = match &job.raw {
+            TransportRaw::Nostr { job_request } => {
+                serde_json::to_string(&job_request.raw_event).unwrap_or_default()
+            }
+        };
+        let mut lg = ledger.lock().await;
+        let _ = lg.record_paid(
+            &job_id,
+            &job.input,
+            &job.input_type,
+            &job.tags,
+            &job.customer_id,
+            job.bid,
+            pr,
+            amount.unwrap_or(0),
+            &raw_json,
+        );
+    }
 
     // Send Processing feedback
     transport
@@ -206,12 +289,27 @@ async fn process_job(
                     JobFeedbackStatus::Error(format!("processing failed: {}", e)),
                 )
                 .await?;
+            // Mark failed in ledger
+            let mut lg = ledger.lock().await;
+            let _ = lg.mark_failed(&job_id);
             return Err(e);
         }
     };
 
+    // Mark executed with cached result (before delivery attempt)
+    {
+        let mut lg = ledger.lock().await;
+        let _ = lg.mark_executed(&job_id, &output.data);
+    }
+
     let result_len = output.data.len();
     transport.deliver_result(&job, &output.data, amount).await?;
+
+    // Mark delivered in ledger
+    {
+        let mut lg = ledger.lock().await;
+        let _ = lg.mark_delivered(&job_id);
+    }
 
     let _ = event_tx.send(AppEvent::JobCompleted {
         job_id,
@@ -228,6 +326,225 @@ async fn process_job(
     Ok(())
 }
 
+/// Recover pending jobs from ledger.
+///
+/// - `Executed` jobs (have result cached) → retry delivery only.
+/// - `Paid` jobs (no result) → re-execute skill + deliver.
+async fn recover_pending_jobs(
+    ledger: &Mutex<JobLedger>,
+    agent: &AgentNode,
+    skills: &SkillRegistry,
+    ctx: &SkillContext,
+    config: &RuntimeConfig,
+    transport: &dyn Transport,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    let pending: Vec<_> = {
+        let lg = ledger.lock().await;
+        lg.pending_jobs().into_iter().cloned().collect()
+    };
+
+    if pending.is_empty() {
+        return;
+    }
+
+    for entry in pending {
+        if entry.retry_count >= MAX_RETRIES {
+            let mut lg = ledger.lock().await;
+            let _ = lg.mark_failed(&entry.job_id);
+            let _ = event_tx.send(AppEvent::JobFailed {
+                job_id: entry.job_id.clone(),
+                error: format!("max retries ({}) exceeded", MAX_RETRIES),
+            });
+            continue;
+        }
+
+        // Increment retry count
+        {
+            let mut lg = ledger.lock().await;
+            let _ = lg.increment_retry(&entry.job_id);
+        }
+
+        // Verify payment is still confirmed on-chain
+        if !config.free_mode {
+            let still_paid = if let Some(payments) = agent.payments.as_ref() {
+                match payments.lookup_payment(&entry.payment_request) {
+                    Ok(status) => status.settled,
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+
+            if !still_paid {
+                let mut lg = ledger.lock().await;
+                let _ = lg.mark_failed(&entry.job_id);
+                continue;
+            }
+        }
+
+        // Reconstruct the raw Nostr event
+        let raw_event: nostr_sdk::Event = match serde_json::from_str(&entry.raw_event_json) {
+            Ok(ev) => ev,
+            Err(_) => {
+                let mut lg = ledger.lock().await;
+                let _ = lg.mark_failed(&entry.job_id);
+                let _ = event_tx.send(AppEvent::JobFailed {
+                    job_id: entry.job_id.clone(),
+                    error: "cannot deserialize stored event".into(),
+                });
+                continue;
+            }
+        };
+
+        // Reconstruct IncomingJob from ledger entry
+        let job = IncomingJob {
+            job_id: entry.job_id.clone(),
+            input: entry.input.clone(),
+            input_type: entry.input_type.clone(),
+            tags: entry.tags.clone(),
+            customer_id: entry.customer_id.clone(),
+            bid: entry.bid,
+            raw: TransportRaw::Nostr {
+                job_request: elisym_core::marketplace::JobRequest {
+                    event_id: raw_event.id,
+                    customer: raw_event.pubkey,
+                    kind_offset: raw_event.kind.as_u16().saturating_sub(5000),
+                    input_data: entry.input.clone(),
+                    input_type: entry.input_type.clone(),
+                    output_mime: None,
+                    bid: entry.bid,
+                    tags: entry.tags.clone(),
+                    raw_event,
+                },
+            },
+        };
+
+        let amount = if config.free_mode {
+            None
+        } else {
+            Some(entry.net_amount)
+        };
+
+        match entry.status {
+            LedgerStatus::Executed => {
+                // Result cached — just retry delivery
+                if let Some(ref result) = entry.result {
+                    let _ = event_tx.send(AppEvent::SkillStarted {
+                        job_id: entry.job_id.clone(),
+                        skill_name: "recovery:deliver".into(),
+                    });
+
+                    match transport.deliver_result(&job, result, amount).await {
+                        Ok(()) => {
+                            let mut lg = ledger.lock().await;
+                            let _ = lg.mark_delivered(&entry.job_id);
+                            let _ = event_tx.send(AppEvent::JobCompleted {
+                                job_id: entry.job_id.clone(),
+                                result_len: result.len(),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(AppEvent::JobFailed {
+                                job_id: entry.job_id.clone(),
+                                error: format!("recovery delivery failed: {}", e),
+                            });
+                        }
+                    }
+                } else {
+                    // Marked as executed but no result cached — treat as Paid
+                    recover_execute_and_deliver(
+                        &entry, &job, amount, skills, ctx, transport, event_tx, ledger,
+                    )
+                    .await;
+                }
+            }
+            LedgerStatus::Paid => {
+                // Need to re-execute skill and deliver
+                recover_execute_and_deliver(
+                    &entry, &job, amount, skills, ctx, transport, event_tx, ledger,
+                )
+                .await;
+            }
+            _ => {} // Delivered/Failed — skip
+        }
+    }
+}
+
+/// Re-execute a skill for a recovered job and deliver the result.
+#[allow(clippy::too_many_arguments)]
+async fn recover_execute_and_deliver(
+    entry: &crate::ledger::LedgerEntry,
+    job: &IncomingJob,
+    amount: Option<u64>,
+    skills: &SkillRegistry,
+    ctx: &SkillContext,
+    transport: &dyn Transport,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+    ledger: &Mutex<JobLedger>,
+) {
+    let skill = match skills.route(&entry.tags) {
+        Some(s) => s,
+        None => {
+            let mut lg = ledger.lock().await;
+            let _ = lg.mark_failed(&entry.job_id);
+            let _ = event_tx.send(AppEvent::JobFailed {
+                job_id: entry.job_id.clone(),
+                error: "no skill available for recovery".into(),
+            });
+            return;
+        }
+    };
+
+    let _ = event_tx.send(AppEvent::SkillStarted {
+        job_id: entry.job_id.clone(),
+        skill_name: format!("recovery:{}", skill.name()),
+    });
+
+    let input = SkillInput {
+        data: entry.input.clone(),
+        input_type: entry.input_type.clone(),
+        tags: entry.tags.clone(),
+        metadata: serde_json::Value::Null,
+        job_id: entry.job_id.clone(),
+    };
+
+    match skill.execute(input, ctx).await {
+        Ok(output) => {
+            // Cache result
+            {
+                let mut lg = ledger.lock().await;
+                let _ = lg.mark_executed(&entry.job_id, &output.data);
+            }
+
+            match transport.deliver_result(job, &output.data, amount).await {
+                Ok(()) => {
+                    let mut lg = ledger.lock().await;
+                    let _ = lg.mark_delivered(&entry.job_id);
+                    let _ = event_tx.send(AppEvent::JobCompleted {
+                        job_id: entry.job_id.clone(),
+                        result_len: output.data.len(),
+                    });
+                }
+                Err(e) => {
+                    let _ = event_tx.send(AppEvent::JobFailed {
+                        job_id: entry.job_id.clone(),
+                        error: format!("recovery delivery failed: {}", e),
+                    });
+                }
+            }
+        }
+        Err(e) => {
+            let mut lg = ledger.lock().await;
+            let _ = lg.mark_failed(&entry.job_id);
+            let _ = event_tx.send(AppEvent::JobFailed {
+                job_id: entry.job_id.clone(),
+                error: format!("recovery execution failed: {}", e),
+            });
+        }
+    }
+}
+
 async fn collect_payment(
     agent: &AgentNode,
     job: &IncomingJob,
@@ -235,9 +552,9 @@ async fn collect_payment(
     price: u64,
     payment_timeout_secs: u32,
     event_tx: &mpsc::UnboundedSender<AppEvent>,
-) -> Result<u64> {
+) -> Result<(u64, String)> {
     let job_id = job.job_id.clone();
-    let payments = agent
+    let _payments = agent
         .payments
         .as_ref()
         .ok_or_else(|| CliError::Other("payments not configured".into()))?;
@@ -275,6 +592,7 @@ async fn collect_payment(
 
     let chain_str = payment_request.chain.to_string();
     let provider_net = price.saturating_sub(fee_amount);
+    let pr_string = payment_request.request.clone();
 
     // Send PaymentRequired feedback
     transport
@@ -294,7 +612,7 @@ async fn collect_payment(
     let poll_interval = Duration::from_secs(2);
 
     let paid = loop {
-        match payments.lookup_payment(&payment_request.request) {
+        match agent.payments.as_ref().unwrap().lookup_payment(&payment_request.request) {
             Ok(status) if status.settled => break true,
             Ok(_) => {}
             Err(_) => {}
@@ -324,7 +642,7 @@ async fn collect_payment(
         net_amount: provider_net,
     });
 
-    Ok(provider_net)
+    Ok((provider_net, pr_string))
 }
 
 #[cfg(test)]

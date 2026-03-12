@@ -109,6 +109,7 @@ pub struct JobEntry {
 pub enum Screen {
     Main,
     JobDetail(usize),
+    Recovery,
 }
 
 pub enum Focus {
@@ -134,6 +135,11 @@ pub struct App {
     // Sound
     pub sound_enabled: bool,
     pub sound_volume: f32,
+    // Recovery
+    pub ledger: Option<std::sync::Arc<tokio::sync::Mutex<crate::ledger::JobLedger>>>,
+    pub recovery_entries: Vec<crate::ledger::LedgerEntry>,
+    pub recovery_table_state: TableState,
+    pub recovery_detail_scroll: u16,
 }
 
 impl App {
@@ -164,6 +170,23 @@ impl App {
             network,
             sound_enabled,
             sound_volume,
+            ledger: None,
+            recovery_entries: Vec::new(),
+            recovery_table_state: TableState::default(),
+            recovery_detail_scroll: 0,
+        }
+    }
+
+    pub fn set_ledger(&mut self, ledger: std::sync::Arc<tokio::sync::Mutex<crate::ledger::JobLedger>>) {
+        self.ledger = Some(ledger);
+    }
+
+    /// Refresh recovery entries from ledger (called when opening recovery screen).
+    pub fn refresh_recovery(&mut self) {
+        if let Some(ref ledger) = self.ledger {
+            if let Ok(lg) = ledger.try_lock() {
+                self.recovery_entries = lg.all_entries();
+            }
         }
     }
 

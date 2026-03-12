@@ -8,8 +8,6 @@ pub(crate) mod global_config;
 pub(crate) mod llm;
 pub(crate) mod protocol;
 
-/// Minimum password length for secret key encryption.
-const MIN_PASSWORD_LEN: usize = 1;
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -18,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Parser;
 use console::style;
-use dialoguer::{Confirm, Input, MultiSelect, Password, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 use nostr_sdk::{Keys, ToBech32};
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
@@ -303,7 +301,7 @@ fn cmd_init() -> Result<String> {
                 println!("  {}", style("Use devnet for testing (free SOL via faucet.solana.com).").dim());
                 let options = &[
                     "devnet (default, testing)",
-                    "mainnet",
+                    "mainnet (coming soon)",
                     "testnet (coming soon)",
                     "\u{2190} Back",
                 ];
@@ -318,15 +316,12 @@ fn cmd_init() -> Result<String> {
                     continue;
                 }
 
-                if idx == 2 {
+                if idx == 1 || idx == 2 {
                     println!("  {}", style("⚠ This network is not available yet.").yellow());
                     continue;
                 }
 
-                network = match idx {
-                    1 => "mainnet",
-                    _ => "devnet",
-                }.to_string();
+                network = "devnet".to_string();
                 step += 1;
             }
 
@@ -444,48 +439,36 @@ fn cmd_init() -> Result<String> {
                 }
             }
 
-            // Step 8: Optional password encryption
+            // Step 8: Password encryption
             8 => {
-                println!("  {}", style("Encrypt your agent's secret keys with a password.").dim());
-                println!("  {}", style("You'll enter this password each time you start the agent.").dim());
-                let options = &[
-                    "Yes, set a password",
-                    "No, store keys unencrypted",
-                    "\u{2190} Back",
-                ];
-                let default = if network == "mainnet" { 0 } else { 1 };
-                let idx = Select::new()
-                    .with_prompt("Encrypt keys?")
-                    .items(options)
-                    .default(default)
+                println!("  {}", style("Set a password to encrypt secret keys (Nostr, Solana, API keys).").dim());
+                println!("  {}", style("Leave empty for no encryption. Type \"back\" to go back.").dim());
+                let pw: String = Password::new()
+                    .with_prompt("Password (empty = no encryption)")
+                    .allow_empty_password(true)
                     .interact()?;
 
-                match idx {
-                    0 => {
-                        let pw = Password::new()
-                            .with_prompt("Password")
-                            .with_confirmation("Confirm password", "Passwords don't match")
-                            .interact()?;
-                        if pw.len() < MIN_PASSWORD_LEN {
-                            println!(
-                                "  {} Password must be at least {} characters.",
-                                style("!").yellow(),
-                                MIN_PASSWORD_LEN,
-                            );
-                            continue;
-                        }
-                        encryption_password = Some(Zeroizing::new(pw));
-                        step += 1;
-                    }
-                    1 => {
-                        encryption_password = None;
-                        step += 1;
-                    }
-                    _ => {
-                        step -= 1;
+                if pw.eq_ignore_ascii_case("back") {
+                    step -= 1;
+                    continue;
+                }
+
+                if pw.is_empty() {
+                    encryption_password = None;
+                    println!("  {} Keys will be stored unencrypted.", style("~").dim());
+                } else {
+                    let pw_confirm: String = Password::new()
+                        .with_prompt("Confirm password")
+                        .allow_empty_password(true)
+                        .interact()?;
+                    if pw != pw_confirm {
+                        println!("  {} Passwords don't match.", style("!").yellow());
                         continue;
                     }
+                    encryption_password = Some(Zeroizing::new(pw));
+                    println!("  {} Keys will be encrypted.", style("*").green());
                 }
+                step += 1;
             }
 
             // Done — build config
@@ -587,7 +570,7 @@ fn cmd_config(name: &str) -> Result<()> {
             // Provider settings
             0 => {
                 loop {
-                    let sub_options = &["Capabilities", "Job price", "LLM provider", "\u{2190} Back"];
+                    let sub_options = &["Job price", "LLM provider", "\u{2190} Back"];
                     let sub_idx = Select::new()
                         .with_prompt("Provider settings")
                         .items(sub_options)
@@ -595,116 +578,8 @@ fn cmd_config(name: &str) -> Result<()> {
                         .interact()?;
 
                     match sub_idx {
-                        // Capabilities
-                        0 => {
-                            let has_real_caps = cfg.capabilities != ["general"]
-                                || !cfg.inactive_capabilities.is_empty();
-
-                            if !has_real_caps {
-                                // No real capabilities — directly offer LLM describe
-                                let caps = prompt_capabilities_llm_sync(&cfg)?;
-                                if !caps.is_empty() {
-                                    cfg.capabilities = caps.iter().map(|(n, _)| n.clone()).collect();
-                                    for (n, p) in &caps {
-                                        cfg.capability_prompts.insert(n.clone(), p.clone());
-                                    }
-                                    save_config_encrypted(&mut cfg, &password)?;
-                                    println!(
-                                        "  {} Capabilities saved: {}",
-                                        style("*").green(),
-                                        cfg.capabilities.join(", ")
-                                    );
-                                }
-                            } else {
-                                // Has real capabilities — show submenu
-                                let cap_sub = &["Toggle capabilities", "Add capabilities (describe)", "\u{2190} Back"];
-                                let cap_idx = Select::new()
-                                    .with_prompt("Capabilities")
-                                    .items(cap_sub)
-                                    .default(0)
-                                    .interact()?;
-
-                                match cap_idx {
-                                    // Toggle
-                                    0 => {
-                                        let all_caps: Vec<String> = cfg
-                                            .capabilities
-                                            .iter()
-                                            .chain(cfg.inactive_capabilities.iter())
-                                            .cloned()
-                                            .collect();
-                                        let defaults: Vec<bool> = all_caps
-                                            .iter()
-                                            .map(|c| cfg.capabilities.contains(c))
-                                            .collect();
-                                        let selections = MultiSelect::new()
-                                            .with_prompt("Capabilities (space to toggle, enter to confirm)")
-                                            .items(&all_caps)
-                                            .defaults(&defaults)
-                                            .interact()?;
-
-                                        let selected: Vec<String> = selections
-                                            .iter()
-                                            .map(|&i| all_caps[i].clone())
-                                            .collect();
-                                        let inactive: Vec<String> = all_caps
-                                            .iter()
-                                            .filter(|c| !selected.contains(c))
-                                            .cloned()
-                                            .collect();
-
-                                        cfg.capabilities = if selected.is_empty() {
-                                            vec!["general".to_string()]
-                                        } else {
-                                            selected
-                                        };
-                                        cfg.inactive_capabilities = inactive;
-                                        save_config_encrypted(&mut cfg, &password)?;
-
-                                        println!(
-                                            "  {} Active: {}",
-                                            style("*").green(),
-                                            cfg.capabilities.join(", ")
-                                        );
-                                        if !cfg.inactive_capabilities.is_empty() {
-                                            println!(
-                                                "  {} Inactive: {}",
-                                                style("~").dim(),
-                                                cfg.inactive_capabilities.join(", ")
-                                            );
-                                        }
-                                    }
-                                    // Add via describe
-                                    1 => {
-                                        let caps = prompt_capabilities_llm_sync(&cfg)?;
-                                        for (n, p) in caps {
-                                            if !cfg.capabilities.contains(&n)
-                                                && !cfg.inactive_capabilities.contains(&n)
-                                            {
-                                                cfg.capabilities.push(n.clone());
-                                                cfg.capability_prompts.insert(n, p);
-                                            } else {
-                                                println!(
-                                                    "  {} Skipped duplicate: {}",
-                                                    style("~").dim(),
-                                                    n
-                                                );
-                                            }
-                                        }
-                                        save_config_encrypted(&mut cfg, &password)?;
-                                        println!(
-                                            "  {} Capabilities saved: {}",
-                                            style("*").green(),
-                                            cfg.capabilities.join(", ")
-                                        );
-                                    }
-                                    // Back
-                                    _ => {}
-                                }
-                            }
-                        }
                         // Job price
-                        1 => {
+                        0 => {
                             println!(
                                 "  {} Current price: {} SOL",
                                 style("~").dim(),
@@ -738,7 +613,7 @@ fn cmd_config(name: &str) -> Result<()> {
                             }
                         }
                         // LLM settings
-                        2 => {
+                        1 => {
                             if let Some(ref llm) = cfg.llm {
                                 println!(
                                     "  {} Current: {} / {}",
@@ -827,7 +702,7 @@ fn cmd_config(name: &str) -> Result<()> {
         style("*").green(),
         style(name).cyan()
     );
-    println!("  Restart agent to publish updated capabilities.");
+    println!("  Restart agent to apply changes.");
 
     Ok(())
 }
@@ -885,118 +760,6 @@ fn prompt_llm_section() -> Result<Option<LlmSection>> {
 }
 
 // ── capability LLM helper ─────────────────────────────────────────────
-
-/// Ask the user to describe what the agent does, then call the LLM to extract
-/// capabilities and generate a system prompt for each.
-/// Returns a Vec of (capability_name, capability_prompt) pairs, or empty if the user backs out.
-async fn prompt_capabilities_llm(config: &AgentConfig) -> Result<Vec<(String, String)>> {
-    let llm_section = config
-        .llm
-        .as_ref()
-        .ok_or_else(|| CliError::Llm("no LLM configured — run `elisym init` to set up".into()))?;
-    let llm = llm::LlmClient::new(llm_section)?;
-
-    let description = match prompt_paste_aware("Describe what your agent can do (or \"back\")")? {
-        Some(s) if !s.is_empty() && !s.eq_ignore_ascii_case("back") => s,
-        _ => return Ok(vec![]),
-    };
-
-    println!("  {} Analyzing capabilities...", style("~").dim());
-
-    let system = "You help AI agents define their capabilities for a marketplace.\n\
-        Given a description of what an agent can do, return a JSON object with:\n\
-        - \"capabilities\": array of objects, each with:\n\
-          - \"name\": short capability keyword (lowercase, hyphenated, e.g. \"code-generation\")\n\
-          - \"prompt\": a detailed system prompt (2-4 sentences) that instructs an AI to excel at this capability\n\
-        Return 3-8 capabilities. Return ONLY the JSON, no other text.";
-
-    let max_retries = 3;
-    let mut last_err = None;
-    let mut response = String::new();
-    for attempt in 0..max_retries {
-        match llm.complete(system, &description).await {
-            Ok(r) => {
-                response = r;
-                last_err = None;
-                break;
-            }
-            Err(e) => {
-                if attempt + 1 < max_retries {
-                    println!(
-                        "  {} {}\n  {} Retrying in 10 seconds... (attempt {}/{})",
-                        style("!").yellow(),
-                        e,
-                        style("~").dim(),
-                        attempt + 2,
-                        max_retries,
-                    );
-                    last_err = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                } else {
-                    return Err(e);
-                }
-            }
-        }
-    }
-    if let Some(e) = last_err {
-        return Err(e);
-    }
-
-    // Parse JSON from LLM response (handle possible markdown fencing)
-    let json_str = response
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-
-    let parsed: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
-        CliError::Llm(format!("failed to parse LLM response as JSON: {}", e))
-    })?;
-
-    let caps = parsed["capabilities"]
-        .as_array()
-        .ok_or_else(|| CliError::Llm("LLM response missing 'capabilities' array".into()))?;
-
-    let mut results: Vec<(String, String)> = Vec::new();
-    for cap in caps {
-        let name = cap["name"].as_str().unwrap_or_default().to_string();
-        let prompt = cap["prompt"].as_str().unwrap_or_default().to_string();
-        if !name.is_empty() && !prompt.is_empty() {
-            results.push((name, prompt));
-        }
-    }
-
-    if results.is_empty() {
-        println!("  {} No capabilities extracted. Try again with more detail.", style("!").yellow());
-        return Ok(vec![]);
-    }
-
-    // Display detected capabilities
-    println!("\n  {} Detected capabilities:\n", style("*").green());
-    for (name, prompt) in &results {
-        println!("  {} {}", style(name).cyan().bold(), style("—").dim());
-        println!("    {}\n", style(prompt).dim());
-    }
-
-    let confirmed = Confirm::new()
-        .with_prompt("Use these capabilities?")
-        .default(true)
-        .interact()?;
-
-    if !confirmed {
-        return Ok(vec![]);
-    }
-
-    Ok(results)
-}
-
-/// Sync wrapper for `prompt_capabilities_llm`, for use inside `cmd_config`.
-fn prompt_capabilities_llm_sync(config: &AgentConfig) -> Result<Vec<(String, String)>> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(prompt_capabilities_llm(config))
-    })
-}
 
 // ── start ─────────────────────────────────────────────────────────────
 
@@ -1187,12 +950,17 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
         ..ctx
     };
 
+    let ledger = Arc::new(tokio::sync::Mutex::new(
+        crate::ledger::JobLedger::open(&name)?,
+    ));
+
     let runtime = crate::runtime::AgentRuntime::new(
         Arc::clone(&agent_node),
         registry,
         ctx,
         runtime_config,
         event_tx.clone(),
+        Arc::clone(&ledger),
     );
     let transport: Box<dyn crate::transport::Transport> = Box::new(
         crate::transport::nostr::NostrTransport::new(
@@ -1203,7 +971,7 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
     );
 
     let gc = global_config::load_global_config();
-    let app = crate::tui::App::new(
+    let mut app = crate::tui::App::new(
         name.clone(),
         skill_name,
         cfg.payment.job_price,
@@ -1213,6 +981,7 @@ async fn cmd_start(name: Option<String>, free: bool) -> Result<()> {
         gc.tui.sound_enabled,
         gc.tui.sound_volume,
     );
+    app.set_ledger(Arc::clone(&ledger));
 
     crate::tui::event::run_tui(app, event_rx, runtime, transport).await?;
 
@@ -1451,20 +1220,6 @@ fn display_wallet_status(solana: &elisym_core::SolanaPaymentProvider, cfg: &Agen
     );
 
     Ok(())
-}
-
-/// Prompt-aware input using dialoguer for capability description.
-/// Returns the trimmed input string, or None if the user typed "back".
-fn prompt_paste_aware(prompt: &str) -> Result<Option<String>> {
-    let input: String = Input::new()
-        .with_prompt(prompt)
-        .interact_text()?;
-    let trimmed = input.trim().to_string();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("back") {
-        Ok(None)
-    } else {
-        Ok(Some(trimmed))
-    }
 }
 
 /// Prompt for password and decrypt secrets if the config is encrypted.

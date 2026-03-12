@@ -78,6 +78,14 @@ pub async fn run_tui(
     result
 }
 
+/// Normalize a KeyCode::Char to lowercase.
+fn normalize_key(code: KeyCode) -> KeyCode {
+    match code {
+        KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+        other => other,
+    }
+}
+
 /// Returns true if the app should quit.
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     // Ctrl+C always quits
@@ -85,8 +93,10 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         return true;
     }
 
+    let code = normalize_key(key.code);
+
     match &app.screen {
-        Screen::Main => match key.code {
+        Screen::Main => match code {
             KeyCode::Char('q') => return true,
             KeyCode::Up | KeyCode::Char('k') => match app.focus {
                 Focus::Table => app.select_prev(),
@@ -113,9 +123,17 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             KeyCode::Char('s') => {
                 app.toggle_sound();
             }
+            KeyCode::Char('r') => {
+                app.refresh_recovery();
+                app.recovery_detail_scroll = 0;
+                if app.recovery_table_state.selected().is_none() && !app.recovery_entries.is_empty() {
+                    app.recovery_table_state.select(Some(0));
+                }
+                app.screen = Screen::Recovery;
+            }
             _ => {}
         },
-        Screen::JobDetail(_) => match key.code {
+        Screen::JobDetail(_) => match code {
             KeyCode::Char('q') => return true,
             KeyCode::Esc => {
                 app.screen = Screen::Main;
@@ -125,6 +143,31 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 app.detail_scroll = app.detail_scroll.saturating_add(1);
+            }
+            _ => {}
+        },
+        Screen::Recovery => match code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Esc | KeyCode::Char('r') => {
+                app.screen = Screen::Main;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let len = app.recovery_entries.len();
+                if len > 0 {
+                    let i = app.recovery_table_state.selected()
+                        .map(|i| if i == 0 { len - 1 } else { i - 1 })
+                        .unwrap_or(0);
+                    app.recovery_table_state.select(Some(i));
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = app.recovery_entries.len();
+                if len > 0 {
+                    let i = app.recovery_table_state.selected()
+                        .map(|i| if i + 1 >= len { 0 } else { i + 1 })
+                        .unwrap_or(0);
+                    app.recovery_table_state.select(Some(i));
+                }
             }
             _ => {}
         },

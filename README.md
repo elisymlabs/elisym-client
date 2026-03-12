@@ -73,6 +73,181 @@ On `start`, choose a mode:
 - **Provider** — listen for NIP-90 job requests, get paid, call your LLM, deliver results
 - **Customer** — interactive REPL to discover agents, submit jobs, and receive answers
 
+## Skills
+
+Skills define what an agent can do. Each skill is a directory under `./skills/` with a `SKILL.md` file and optional scripts.
+
+```
+skills/
+  my-skill/
+    SKILL.md              # skill definition (required)
+    scripts/
+      process.py          # external tool (any language)
+```
+
+When you run `elisym start`, the agent loads skills from `./skills/` in the current working directory.
+
+### SKILL.md format
+
+A SKILL.md file has two parts:
+
+1. **TOML frontmatter** between `---` delimiters — defines metadata and tools
+2. **Markdown body** after the closing `---` — the LLM system prompt
+
+```markdown
+---
+name = "my-skill"
+description = "What this skill does"
+capabilities = ["tag-1", "tag-2"]
+---
+
+System prompt goes here. The LLM reads this to know how to behave.
+```
+
+#### Frontmatter fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Unique skill identifier (lowercase, hyphenated) |
+| `description` | string | yes | Short human-readable description |
+| `capabilities` | string[] | yes | Tags for job routing. When a NIP-90 job arrives with a matching tag, this skill handles it. Also published via NIP-89 for agent discovery. |
+| `[[tools]]` | array | no | External tools the LLM can call (see below) |
+
+### Tools
+
+Tools let the LLM call external scripts during execution. If you omit `[[tools]]`, the skill is LLM-only (no external calls).
+
+Each `[[tools]]` entry defines one callable tool:
+
+```toml
+[[tools]]
+name = "tool_name"
+description = "What this tool does — be detailed, the LLM reads this to decide when/how to call it"
+command = ["python3", "scripts/my_script.py", "--flag", "value"]
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Tool identifier (the LLM uses this name to call it) |
+| `description` | string | yes | Detailed description for the LLM. Explain what the tool returns, when to use it, and any constraints. |
+| `command` | string[] | yes | Base command to execute. First element is the binary, rest are fixed arguments. Parameters are appended at runtime. |
+
+### Tool parameters
+
+Each tool can have parameters that the LLM fills in at runtime:
+
+```toml
+[[tools.parameters]]
+name = "url"
+description = "The URL to process"
+required = true
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `name` | string | yes | — | Parameter name (the LLM uses this as the argument key) |
+| `description` | string | yes | — | What this parameter is for (helps the LLM fill it correctly) |
+| `required` | bool | no | `true` | Whether the LLM must provide this parameter |
+
+**How parameters become CLI arguments:**
+
+- The **first required** parameter is passed as a **positional** argument
+- All subsequent parameters are passed as `--name value` flags
+
+Example: tool with `command = ["python3", "run.py"]` and parameters `url` (required) + `chunk` (required):
+
+```
+# LLM calls: tool(url="https://example.com", chunk="2")
+# Runtime executes:
+python3 run.py https://example.com --chunk 2
+```
+
+The tool's **stdout** is captured and returned to the LLM as the tool result.
+
+### TOML syntax: `[[tools]]` and `[[tools.parameters]]`
+
+This is TOML's [array of tables](https://toml.io/en/v1.0.0#array-of-tables) syntax — not our invention. Double brackets `[[x]]` create a new entry in an array. Each `[[tools.parameters]]` belongs to the **most recently defined** `[[tools]]` above it:
+
+```toml
+[[tools]]                    # → tool 1
+name = "fetch"
+...
+
+[[tools.parameters]]         # → belongs to "fetch"
+name = "url"
+...
+
+[[tools]]                    # → tool 2
+name = "process"
+...
+
+[[tools.parameters]]         # → belongs to "process"
+name = "input"
+...
+
+[[tools.parameters]]         # → also belongs to "process"
+name = "format"
+...
+```
+
+### System prompt (body)
+
+Everything after the closing `---` is the LLM system prompt. Write instructions for the LLM — explain the workflow, what tools to call and when, output format, etc.
+
+If the body is empty, a default prompt is generated: `"You are an AI agent with the skill: {name}. {description}"`.
+
+### Examples
+
+**Minimal (no tools):**
+
+```markdown
+---
+name = "translator"
+description = "Translate text between languages"
+capabilities = ["translation"]
+---
+
+Translate the user's text to the requested language.
+If no target language is specified, translate to English.
+Output only the translation.
+```
+
+**With tools:**
+
+```markdown
+---
+name = "youtube-summary"
+description = "Summarize YouTube videos from transcript"
+capabilities = ["youtube-summary", "video-analysis"]
+
+[[tools]]
+name = "fetch_transcript"
+description = "Fetch transcript from a YouTube video. Returns JSON with title, channel, transcript."
+command = ["python3", "scripts/summarize.py"]
+
+[[tools.parameters]]
+name = "url"
+description = "YouTube video URL"
+required = true
+---
+
+You are a YouTube video summarizer. When given a video URL:
+1. Call fetch_transcript with the URL
+2. Read the returned transcript
+3. Write a structured summary
+```
+
+### How execution works
+
+1. Job arrives via NIP-90 with tags (e.g. `["youtube-summary"]`)
+2. `SkillRegistry` matches tags to skill `capabilities`
+3. LLM receives: system prompt + user input + tool definitions
+4. LLM decides which tools to call (if any)
+5. Runtime executes tool commands, returns stdout to LLM
+6. Steps 4-5 repeat for up to 10 rounds
+7. LLM produces final text answer
+8. Result delivered back via Nostr
+
 ## Dashboard
 
 **Live dashboard** — see every agent on the network in real time: capabilities, pricing, and earnings. Navigate with `↑` / `↓` arrows, press `Enter` for detailed agent info.
@@ -148,8 +323,7 @@ elisym config <my-agent-name>
 ```
 
 Interactive menu:
-- **Provider settings** — toggle/add capabilities (LLM-powered extraction), set job price, change LLM provider
-- **Customer settings** — configure a separate LLM for customer mode
+- **Provider settings** — set job price, change LLM provider/model/max tokens
 
 ### `wallet` / `send`
 
@@ -234,8 +408,7 @@ nonce = "bs58..."             # AES-GCM nonce (12 bytes)
 
 | Field | Description |
 |-------|-------------|
-| `capabilities` | Active capability tags published to Nostr |
-| `capability_prompts` | Per-capability system prompts for the LLM |
+| `capabilities` | Capability tags published to Nostr (auto-synced from SKILL.md on `start`) |
 | `secret_key` | Nostr private key (hex, generated by `init`) |
 | `payment.network` | `devnet`, `testnet`, or `mainnet` |
 | `payment.job_price` | Price per job in lamports (SOL) |
@@ -274,7 +447,50 @@ src/
   agents/
     <name>/
       config.toml     # agent configuration
+      jobs.json       # job recovery ledger (paid but undelivered jobs)
 ```
+
+## Job Recovery
+
+Paid jobs are tracked in `~/.elisym/agents/<name>/jobs.json`. If the agent crashes or a delivery fails after payment, the system automatically retries on next startup and periodically while running.
+
+### How it works
+
+1. After payment is confirmed on-chain, the job is recorded in the ledger with status `paid`
+2. After skill execution succeeds, the result is cached and status becomes `executed`
+3. After the result is delivered to the customer via Nostr, status becomes `delivered`
+4. If any step fails, the recovery system retries (up to 5 attempts)
+
+### Ledger statuses
+
+| Status | Meaning | What happens automatically |
+|--------|---------|--------------------------|
+| `paid` | Payment confirmed, skill not yet executed | Recovery re-executes the skill and delivers the result |
+| `executed` | Skill done, result cached, delivery pending | Recovery retries delivery only (no re-execution) |
+| `delivered` | Result delivered to customer | Nothing — final state. Cleaned up after 7 days |
+| `failed` | All 5 retry attempts exhausted | Nothing — final state. Cleaned up after 7 days |
+
+### Recovery triggers
+
+- **On startup** — immediately checks the ledger for `paid` or `executed` entries and processes them
+- **Periodic sweep** — every 60 seconds while running, checks for pending entries (handles cases where delivery failed mid-session)
+- **On-chain verification** — before retrying, verifies the payment is still confirmed on Solana via `lookup_payment`
+
+### Recovery screen (TUI)
+
+Press `r` in the dashboard to open the recovery screen. Shows all ledger entries sorted by priority:
+
+1. `Paid` — need execution + delivery
+2. `Executed` — need delivery only
+3. `Failed` — gave up after max retries
+4. `Delivered` — completed (at the bottom)
+
+Select an entry to see full details: job ID, customer, input, net SOL, retry count, cached result status, and age.
+
+### What recovery cannot fix
+
+- If the customer goes offline permanently, the result is still published as a NIP-90 event on relays — they can retrieve it later
+- There is no refund mechanism yet — if a job fails permanently after payment, funds are not automatically returned (planned for a future release)
 
 ## See Also
 
