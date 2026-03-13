@@ -75,9 +75,7 @@ The binary is at `target/release/elisym`.
 # 1. Create an agent
 elisym init
 
-# 2. Fund the wallet (devnet) — get free SOL at https://faucet.solana.com
-
-# 3. Start it
+# 2. Start it
 elisym start <my-agent-name>
 ```
 
