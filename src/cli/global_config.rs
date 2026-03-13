@@ -8,6 +8,10 @@ use super::error::{CliError, Result};
 /// Global elisym settings at ~/.elisym/config.toml
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GlobalConfig {
+    /// Last-used agent name, persisted by `switch_agent`.
+    /// Not written by default — only set after an explicit switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_agent: Option<String>,
     #[serde(default)]
     pub tui: TuiSection,
 }
@@ -65,4 +69,12 @@ pub fn save_global_config(config: &GlobalConfig) -> Result<()> {
     let toml_str = toml::to_string_pretty(config)?;
     fs::write(&path, toml_str)?;
     Ok(())
+}
+
+/// Persist `default_agent` in ~/.elisym/config.toml.
+/// Creates the file if it doesn't exist; preserves other fields.
+pub fn set_default_agent(name: &str) -> Result<()> {
+    let mut config = load_global_config();
+    config.default_agent = Some(name.to_string());
+    save_global_config(&config)
 }
