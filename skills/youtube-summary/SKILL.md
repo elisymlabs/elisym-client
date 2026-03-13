@@ -1,6 +1,6 @@
 ---
 name = "youtube-summary"
-description = "Summarize YouTube videos from transcript"
+description = "Summarize YouTube videos from transcript. Paste a YouTube link and get a structured summary."
 capabilities = ["youtube-summary", "video-analysis"]
 max_tool_rounds = 15
 
