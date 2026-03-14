@@ -1,6 +1,6 @@
 ---
 name = "web-search"
-description = "Search the web using DuckDuckGo"
+description = "Web search agent. Send a query — get top results with titles, links, and snippets"
 capabilities = ["web-search", "search"]
 
 [[tools]]

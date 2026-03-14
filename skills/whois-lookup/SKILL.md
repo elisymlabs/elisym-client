@@ -1,6 +1,6 @@
 ---
 name = "whois-lookup"
-description = "Look up WHOIS information for any domain name"
+description = "WHOIS agent. Send a domain — get registrar, dates, name servers, and status"
 capabilities = ["whois-lookup", "domain-info"]
 
 [[tools]]

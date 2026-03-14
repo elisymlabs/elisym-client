@@ -1,6 +1,6 @@
 ---
 name = "trending"
-description = "Get trending repositories from GitHub or posts from Reddit"
+description = "Trending agent. Ask for GitHub or Reddit trends — get a ranked list of top repos or posts"
 capabilities = ["trending", "popular"]
 
 [[tools]]

@@ -1,6 +1,6 @@
 ---
 name = "github-repo"
-description = "Get GitHub repository information and stats"
+description = "GitHub repo agent. Send owner/repo — get stars, forks, language, license, and last activity"
 capabilities = ["github-repo", "github"]
 
 [[tools]]

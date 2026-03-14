@@ -1,6 +1,6 @@
 ---
 name = "site-status"
-description = "Check website availability, response time, and SSL status"
+description = "Uptime check agent. Send a URL — get HTTP status, response time, SSL validity, and redirects"
 capabilities = ["site-status", "uptime-check"]
 
 [[tools]]

@@ -1,6 +1,6 @@
 ---
 name = "stock-price"
-description = "Get real-time stock quotes using Yahoo Finance"
+description = "Stock quote agent. Send a ticker (e.g. AAPL) — get price, daily change, volume, and 52-week range"
 capabilities = ["stock-price", "stocks"]
 
 [[tools]]
