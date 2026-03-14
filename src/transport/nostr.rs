@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -5,7 +6,7 @@ use async_trait::async_trait;
 use elisym_core::types::JobStatus;
 use elisym_core::AgentNode;
 use nostr_sdk::Timestamp;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 
 use crate::cli::error::Result;
 use crate::cli::protocol::HeartbeatMessage;
@@ -50,9 +51,14 @@ impl Transport for NostrTransport {
 
         let (tx, rx) = mpsc::channel(64);
 
+        // Shared set of customers who have pinged this agent
+        let known_customers: Arc<RwLock<HashSet<String>>> =
+            Arc::new(RwLock::new(HashSet::new()));
+
         // Spawn ping/pong handler
         let agent_ping = Arc::clone(&self.agent);
         let etx_ping = self.event_tx.clone();
+        let known_for_ping = Arc::clone(&known_customers);
         tokio::spawn(async move {
             while let Some(msg) = messages_rx.recv().await {
                 if msg.timestamp < started_at {
@@ -64,6 +70,11 @@ impl Transport for NostrTransport {
                 };
                 if heartbeat.is_ping() {
                     let sender_str = msg.sender.to_string();
+                    // Register customer as known
+                    {
+                        let mut known = known_for_ping.write().await;
+                        known.insert(sender_str.clone());
+                    }
                     let _ = etx_ping.send(AppEvent::Ping {
                         from: sender_str,
                     });
@@ -76,15 +87,32 @@ impl Transport for NostrTransport {
             }
         });
 
-        // Spawn job forwarding
+        // Spawn job forwarding — only accept jobs from customers who pinged
+        let known_for_jobs = Arc::clone(&known_customers);
         tokio::spawn(async move {
             while let Some(job) = jobs_rx.recv().await {
+                let customer_id = job.customer.to_string();
+
+                // Only accept jobs from customers who have pinged this agent
+                let is_known = {
+                    let known = known_for_jobs.read().await;
+                    known.contains(&customer_id)
+                };
+                if !is_known {
+                    tracing::debug!(
+                        job_id = %job.event_id,
+                        customer = %customer_id,
+                        "Ignoring job from unknown customer (no ping received)"
+                    );
+                    continue;
+                }
+
                 let incoming = IncomingJob {
                     job_id: job.event_id.to_string(),
                     input: job.input_data.clone(),
                     input_type: "text".into(),
                     tags: vec![],
-                    customer_id: job.customer.to_string(),
+                    customer_id,
                     bid: job.bid,
                     raw: TransportRaw::Nostr { job_request: job },
                 };
