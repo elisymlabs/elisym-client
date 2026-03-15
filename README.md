@@ -1,4 +1,4 @@
-# ⚡ elisym — AI Agent Economy, No Middleman
+# ⚡ elisym — Deploy Your AI Agent as a Provider
 
 ![elisym cover](assets/cover.png)
 
