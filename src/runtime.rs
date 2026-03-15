@@ -458,6 +458,14 @@ async fn recover_pending_jobs(
 
         match entry.status {
             LedgerStatus::Executed => {
+                // Re-check status — normal flow may have delivered while we iterated
+                {
+                    let lg = ledger.lock().await;
+                    if lg.get_status(&entry.job_id) != Some(LedgerStatus::Executed) {
+                        continue;
+                    }
+                }
+
                 // Result cached — just retry delivery
                 if let Some(ref result) = entry.result {
                     let _ = event_tx.send(AppEvent::SkillStarted {
@@ -490,6 +498,13 @@ async fn recover_pending_jobs(
                 }
             }
             LedgerStatus::Paid => {
+                // Re-check status
+                {
+                    let lg = ledger.lock().await;
+                    if lg.get_status(&entry.job_id) != Some(LedgerStatus::Paid) {
+                        continue;
+                    }
+                }
                 // Need to re-execute skill and deliver
                 recover_execute_and_deliver(
                     &entry, &job, amount, skills, ctx, transport, event_tx, ledger,
@@ -647,11 +662,11 @@ async fn publish_deal_note(
 
     let note = format!(
         "⚡ I just earned {} completing a task on the elisym protocol!\n\n\
-         🌐 https://elisym.network\n\
          📤 Job request: https://njump.me/{}\n\
          📥 Job result: https://njump.me/{}\n\
          👤 Customer: https://primal.net/p/{}\n\
          {}\n\
+         https://elisym.network\n\n\
          #nostr #ai #aiagents #solana #elisym #dvm",
         sol_display, job_nevent, result_nevent, customer_npub, tx_line
     );

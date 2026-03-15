@@ -22,6 +22,9 @@ pub enum Commands {
         /// Job price in SOL (e.g. "0.001"), skips interactive price prompt
         #[arg(long)]
         price: Option<String>,
+        /// Write debug logs to ~/.elisym/agent.log
+        #[arg(long)]
+        log: bool,
     },
 
     /// List all configured agents

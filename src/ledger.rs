@@ -193,6 +193,11 @@ impl JobLedger {
         entries
     }
 
+    /// Get the current status of a job, if it exists.
+    pub fn get_status(&self, job_id: &str) -> Option<LedgerStatus> {
+        self.entries.get(job_id).map(|e| e.status.clone())
+    }
+
     /// Get all jobs that need recovery (paid or executed but not delivered).
     pub fn pending_jobs(&self) -> Vec<&LedgerEntry> {
         self.entries

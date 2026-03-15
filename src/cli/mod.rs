@@ -28,8 +28,9 @@ use self::error::{CliError, Result};
 use crate::util::{format_sol, format_sol_compact, sol_to_lamports};
 
 /// Initialize tracing subscriber with a reloadable filter.
-/// Returns a handle that can silence tracing when TUI is active.
-fn init_tracing() {
+/// stderr layer can be silenced when TUI is active.
+/// When `file_log` is true, also writes to ~/.elisym/agent.log (survives TUI silence).
+fn init_tracing(file_log: bool) {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::reload;
@@ -40,11 +41,37 @@ fn init_tracing() {
 
     let (filter_layer, handle) = reload::Layer::new(base_filter);
 
-    let fmt_layer = tracing_subscriber::fmt::layer();
+    // stderr layer with reloadable filter (can be silenced by TUI)
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_filter(filter_layer);
+
+    // File-based log layer (--verbose / -v)
+    let file_layer = if file_log {
+        let log_dir = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".elisym");
+        let _ = std::fs::create_dir_all(&log_dir);
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join("agent.log"))
+            .ok();
+        log_file.map(|f| {
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::sync::Mutex::new(f))
+                .with_ansi(false)
+                .with_filter(
+                    EnvFilter::new("elisym_core=debug,elisym=debug,elisym_client=debug")
+                        .add_directive("nostr_relay_pool=off".parse().unwrap()),
+                )
+        })
+    } else {
+        None
+    };
 
     let subscriber = tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(fmt_layer);
+        .with(fmt_layer)
+        .with(file_layer);
 
     let _ = tracing::subscriber::set_global_default(subscriber);
 
@@ -202,13 +229,14 @@ async fn fetch_models_async(provider: &str, api_key: &str) -> std::result::Resul
 }
 
 pub async fn run() -> Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
+
+    let file_log = matches!(&cli.command, Some(Commands::Start { log: true, .. }));
+    init_tracing(file_log);
 
     match cli.command {
         Some(Commands::Init) => { cmd_init()?; },
-        Some(Commands::Start { name, headless, price }) => cmd_start(name, headless, price).await?,
+        Some(Commands::Start { name, headless, price, .. }) => cmd_start(name, headless, price).await?,
         Some(Commands::List) => cmd_list()?,
         Some(Commands::Status { name }) => cmd_status(&name)?,
         Some(Commands::Delete { name }) => cmd_delete(&name)?,
