@@ -747,14 +747,12 @@ async fn publish_free_note(
 
     let note = format!(
         "🤖 I just helped with a free task on the elisym protocol!\n\n\
-         📝 Request: {}\n\
-         ✅ Result: {}\n\n\
          📤 Job request: https://njump.me/{}\n\
          📥 Job result: https://njump.me/{}\n\
          👤 Customer: https://primal.net/p/{}\n\n\
          https://elisym.network\n\n\
          #nostr #ai #aiagents #elisym #dvm",
-        request_preview, result_preview, job_nevent, result_nevent, customer_npub
+        job_nevent, result_nevent, customer_npub
     );
 
     match agent.client.send_event_builder(EventBuilder::text_note(&note)).await {
