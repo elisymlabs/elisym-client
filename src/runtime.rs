@@ -345,7 +345,7 @@ async fn process_job(
     if let Some(net_amount) = amount {
         publish_deal_note(agent, &job, result_event_id, net_amount, tx_signature.as_deref(), &config.network).await;
     } else {
-        publish_free_note(agent, &job, result_event_id, &output.data).await;
+        publish_free_note(agent, &job, result_event_id).await;
     }
 
     // Update wallet balance
@@ -694,7 +694,6 @@ async fn publish_free_note(
     agent: &AgentNode,
     job: &IncomingJob,
     result_event_id: EventId,
-    result_text: &str,
 ) {
     // Encode job event ID as nevent
     let job_event_id = match EventId::parse(&job.job_id) {
@@ -731,19 +730,6 @@ async fn publish_free_note(
         .ok()
         .and_then(|pk| pk.to_bech32().ok())
         .unwrap_or_else(|| job.customer_id.clone());
-
-    // Truncate request/result for the note (keep it readable)
-    let max_len = 280;
-    let request_preview = if job.input.len() > max_len {
-        format!("{}…", &job.input[..max_len])
-    } else {
-        job.input.clone()
-    };
-    let result_preview = if result_text.len() > max_len {
-        format!("{}…", &result_text[..max_len])
-    } else {
-        result_text.to_string()
-    };
 
     let note = format!(
         "🤖 I just helped with a free task on the elisym protocol!\n\n\
