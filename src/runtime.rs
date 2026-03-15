@@ -341,9 +341,11 @@ async fn process_job(
         result_len,
     });
 
-    // Publish deal note for paid jobs
+    // Publish deal note
     if let Some(net_amount) = amount {
         publish_deal_note(agent, &job, result_event_id, net_amount, tx_signature.as_deref(), &config.network).await;
+    } else {
+        publish_free_note(agent, &job, result_event_id, &output.data).await;
     }
 
     // Update wallet balance
@@ -681,6 +683,90 @@ async fn publish_deal_note(
         }
         Err(e) => {
             tracing::warn!("Failed to publish deal note for job {}: {}", job.job_id, e);
+        }
+    }
+}
+
+/// Publish a kind:1 Nostr note for a completed free job.
+/// Includes the request text and response text.
+/// Best-effort: logs warning on failure, never propagates errors.
+async fn publish_free_note(
+    agent: &AgentNode,
+    job: &IncomingJob,
+    result_event_id: EventId,
+    result_text: &str,
+) {
+    // Encode job event ID as nevent
+    let job_event_id = match EventId::parse(&job.job_id) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!("Failed to parse job event ID for free note: {}", e);
+            return;
+        }
+    };
+    let relays: Vec<String> = vec![
+        "wss://relay.damus.io".into(),
+        "wss://nos.lol".into(),
+    ];
+    let job_nevent = Nip19Event {
+        event_id: job_event_id,
+        relays: relays.clone(),
+        author: None,
+        kind: None,
+    }
+    .to_bech32()
+    .unwrap_or_default();
+
+    let result_nevent = Nip19Event {
+        event_id: result_event_id,
+        relays,
+        author: None,
+        kind: None,
+    }
+    .to_bech32()
+    .unwrap_or_default();
+
+    // Encode customer npub
+    let customer_npub = PublicKey::parse(&job.customer_id)
+        .ok()
+        .and_then(|pk| pk.to_bech32().ok())
+        .unwrap_or_else(|| job.customer_id.clone());
+
+    // Truncate request/result for the note (keep it readable)
+    let max_len = 280;
+    let request_preview = if job.input.len() > max_len {
+        format!("{}…", &job.input[..max_len])
+    } else {
+        job.input.clone()
+    };
+    let result_preview = if result_text.len() > max_len {
+        format!("{}…", &result_text[..max_len])
+    } else {
+        result_text.to_string()
+    };
+
+    let note = format!(
+        "🤖 I just helped with a free task on the elisym protocol!\n\n\
+         📝 Request: {}\n\
+         ✅ Result: {}\n\n\
+         📤 Job request: https://njump.me/{}\n\
+         📥 Job result: https://njump.me/{}\n\
+         👤 Customer: https://primal.net/p/{}\n\n\
+         https://elisym.network\n\n\
+         #nostr #ai #aiagents #elisym #dvm",
+        request_preview, result_preview, job_nevent, result_nevent, customer_npub
+    );
+
+    match agent.client.send_event_builder(EventBuilder::text_note(&note)).await {
+        Ok(output) => {
+            tracing::info!(
+                event_id = %output.val,
+                "Published free note for job {}",
+                job.job_id
+            );
+        }
+        Err(e) => {
+            tracing::warn!("Failed to publish free note for job {}: {}", job.job_id, e);
         }
     }
 }
