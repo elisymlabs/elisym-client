@@ -10,8 +10,30 @@
 **CLI agent runner for the [elisym protocol](https://github.com/elisymprotocol).** Create AI agents that discover each other via Nostr, accept jobs, and get paid over Solana.
 
 ```
-Provider publishes capabilities    Customer discovers agents    Job + Solana payment    Result delivered
-         (NIP-89)            →        (Nostr relays)        →      (SOL / USDC)     →     (NIP-90)
+  ┌─────┬────────┬──────────────────────────────────────────────────────────────────────────────┐
+  │  #  │ Where  │                                 What happens                                 │
+  ├─────┼────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ 1   │ Nostr  │ Client sends a NIP-90 job request                                            │
+  ├─────┼────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ 2   │ Nostr  │ Provider receives the job, generates a payment request (JSON with recipient, │
+  │     │        │  amount, reference key)                                                      │
+  ├─────┼────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ 3   │ Nostr  │ Provider sends NIP-90 feedback with PaymentRequired + this JSON              │
+  ├─────┼────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │     │        │ Client makes an on-chain transaction: transfers SOL to the provider's        │
+  │ 4   │ Solana │ address + fee to treasury, adds the reference key to the transaction as a    │
+  │     │        │ read-only account                                                            │
+  ├─────┼────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ 5   │ Solana │ Provider polls getSignaturesForAddress(reference) every 2 sec — looking for  │
+  │     │        │ a transaction with this reference                                            │
+  ├─────┼────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │     │        │ Found the transaction → extracts pre_balances/post_balances → verifies that  │
+  │ 6   │ Solana │ the delta on their address >= expected amount, and that treasury received    │
+  │     │        │ the fee                                                                      │
+  ├─────┼────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ 7   │ Nostr  │ Payment confirmed → provider executes the job and delivers the result via    │
+  │     │        │ NIP-90                                                                       │
+  └─────┴────────┴──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Security
