@@ -120,6 +120,7 @@ When you run `elisym start`, the agent loads skills from `./skills/` in the curr
 **Dependencies:** Skills that use Python scripts require Python 3. Install all dependencies for the included example skills at once:
 
 ```bash
+cp -r skills-examples/* skills/
 pip install -r skills/requirements.txt
 ```
 
