@@ -1250,7 +1250,7 @@ fn cmd_send(name: &str, address: &str, amount: &str) -> Result<()> {
         return Ok(());
     }
 
-    match solana.send_transfer(address, base_amount) {
+    match solana.transfer(address, base_amount) {
         Ok(signature) => {
             println!(
                 "\n  {} Sent {} {}",
