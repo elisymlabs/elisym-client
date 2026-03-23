@@ -78,6 +78,11 @@ pub async fn build_agent(config: &AgentConfig) -> Result<AgentNode> {
         .publish_capability(&agent.capability_card, &[elisym_core::KIND_JOB_REQUEST_BASE + elisym_core::DEFAULT_KIND_OFFSET])
         .await?;
 
+    // Update kind:0 Nostr profile (once at startup)
+    if let Err(e) = agent.discovery.update_profile(&agent.capability_card).await {
+        tracing::warn!(error = %e, "Failed to update Nostr profile, continuing");
+    }
+
     // Auto-follow the elisymlabs account
     if let Ok(protocol_pk) = PublicKey::from_hex(crate::constants::ELISYM_PROTOCOL_PUBKEY) {
         let contacts = vec![Contact::new::<String>(protocol_pk, None, None)];
