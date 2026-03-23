@@ -176,6 +176,26 @@ impl AgentRuntime {
             }
         });
 
+        // Spawn periodic heartbeat — republish capability card every 60s
+        // to keep `created_at` fresh on relays (NIP-89 replaceable event).
+        let heartbeat_agent = Arc::clone(&agent);
+        let heartbeat_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await; // skip first immediate tick
+            let kinds = &[elisym_core::KIND_JOB_REQUEST_BASE + elisym_core::DEFAULT_KIND_OFFSET];
+            loop {
+                interval.tick().await;
+                match heartbeat_agent
+                    .discovery
+                    .publish_capability(&heartbeat_agent.capability_card, kinds)
+                    .await
+                {
+                    Ok(id) => tracing::debug!(event_id = %id, "Heartbeat: republished capability card"),
+                    Err(e) => tracing::warn!(error = %e, "Heartbeat: failed to republish capability card"),
+                }
+            }
+        });
+
         loop {
             tokio::select! {
                 Some(job) = jobs_rx.recv() => {
@@ -263,8 +283,9 @@ impl AgentRuntime {
             }
         }
 
-        // Stop recovery sweep
+        // Stop background tasks
         recovery_handle.abort();
+        heartbeat_handle.abort();
 
         // Drain remaining tasks with timeout
         if !tasks.is_empty() {
