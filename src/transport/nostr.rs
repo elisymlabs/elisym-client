@@ -58,7 +58,7 @@ impl Transport for NostrTransport {
 
         let (tx, rx) = mpsc::channel(64);
 
-        // Spawn ping/pong handler (ephemeral kind:20100/20101)
+        // Spawn ping/pong handler (ephemeral kind 20200/20201)
         let agent_ping = Arc::clone(&self.agent);
         let etx_ping = self.event_tx.clone();
         tokio::spawn(async move {
@@ -66,9 +66,12 @@ impl Transport for NostrTransport {
                 let sender_str = sender.to_string();
                 tracing::info!(sender = %sender_str, "Ping received");
                 let _ = etx_ping.send(AppEvent::Ping {
-                    from: sender_str,
+                    from: sender_str.clone(),
                 });
-                let _ = agent_ping.messaging.send_pong(&sender, &nonce).await;
+                match agent_ping.messaging.send_pong(&sender, &nonce).await {
+                    Ok(()) => tracing::info!(sender = %sender_str, "Pong sent"),
+                    Err(e) => tracing::warn!(sender = %sender_str, error = %e, "Pong failed"),
+                }
             }
         });
 
